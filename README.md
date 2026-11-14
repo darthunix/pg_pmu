@@ -62,14 +62,19 @@ EXPLAIN (ANALYZE, PMU, COSTS off, TIMING off, BUFFERS off)
 ```
  Aggregate (actual rows=1.00 loops=1)
    ->  Seq Scan on t (actual rows=100000.00 loops=1)
- Planning Time: 0.175 ms
- Execution PMU: instructions=117361857 cycles=15273091
- Execution Time: 4.198 ms
+ Planning Time: 0.349 ms
+ Planning PMU: instructions=2165997 cycles=1212815
+ Execution PMU: instructions=49678384 cycles=10563856
+ Execution Time: 3.769 ms
 ```
 
-In JSON and YAML the counts are the properties "Execution
-Instructions" and "Execution Cycles" of the query, in XML the elements
-`Execution-Instructions` and `Execution-Cycles`. They come after the
+The planning is counted when this EXPLAIN planned the statement; a
+plan from the cache of prepared statements, as with `EXPLAIN EXECUTE`,
+has no counts of planning, even when the cache makes it during the
+EXPLAIN. In JSON and YAML the counts are the properties "Planning
+Instructions", "Planning Cycles", "Execution Instructions" and
+"Execution Cycles" of the query, in XML the elements with the spaces
+replaced by hyphens, `Planning-Instructions` and so on. They come after the
 plan, the triggers, JIT and serialization, and before "Execution
 Time", also with `SUMMARY off`. Each plan of an EXPLAIN has its own,
 as with a rule that makes two.

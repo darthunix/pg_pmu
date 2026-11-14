@@ -37,8 +37,9 @@ SELECT * FROM pmu_explain($$
               pmu_explain               
 ----------------------------------------
  Result (actual rows=1.00 loops=1)
+ Planning PMU: instructions=N cycles=N
  Execution PMU: instructions=N cycles=N
-(2 rows)
+(3 rows)
 
 SELECT is_called FROM s;
  is_called 
@@ -76,9 +77,10 @@ SELECT * FROM pmu_explain($$
 ----------------------------------------
  Result (actual rows=1.00 loops=1)
  Planning Time: N ms
+ Planning PMU: instructions=N cycles=N
  Execution PMU: instructions=N cycles=N
  Execution Time: N ms
-(4 rows)
+(5 rows)
 
 -- The counts come before "Execution Time" also with SUMMARY off.
 SELECT * FROM pmu_explain($$
@@ -87,8 +89,9 @@ SELECT * FROM pmu_explain($$
               pmu_explain               
 ----------------------------------------
  Result (actual rows=1.00 loops=1)
+ Planning PMU: instructions=N cycles=N
  Execution PMU: instructions=N cycles=N
-(2 rows)
+(3 rows)
 
 -- spec: explain-pmu/JSON and YAML
 SELECT * FROM pmu_explain($$
@@ -108,6 +111,8 @@ SELECT * FROM pmu_explain($$
      },                          +
      "Triggers": [               +
      ],                          +
+     "Planning Instructions": N, +
+     "Planning Cycles": N,       +
      "Execution Instructions": N,+
      "Execution Cycles": N       +
    }                             +
@@ -127,6 +132,8 @@ SELECT * FROM pmu_explain($$
      Actual Loops: 1        +
      Disabled: false        +
    Triggers:                +
+   Planning Instructions: N +
+   Planning Cycles: N       +
    Execution Instructions: N+
    Execution Cycles: N
 (1 row)
@@ -158,6 +165,8 @@ SELECT * FROM pmu_explain($$
      </Plan>                                             +
      <Triggers>                                          +
      </Triggers>                                         +
+     <Planning-Instructions>N</Planning-Instructions>    +
+     <Planning-Cycles>N</Planning-Cycles>                +
      <Execution-Instructions>N</Execution-Instructions>  +
      <Execution-Cycles>N</Execution-Cycles>              +
    </Query>                                              +
@@ -207,12 +216,14 @@ SELECT * FROM pmu_explain($$
 ---------------------------------------------
  Insert on ruled (actual rows=0.00 loops=1)
    ->  Result (actual rows=1.00 loops=1)
+ Planning PMU: instructions=N cycles=N
  Execution PMU: instructions=N cycles=N
  
  Insert on copied (actual rows=0.00 loops=1)
    ->  Result (actual rows=1.00 loops=1)
+ Planning PMU: instructions=N cycles=N
  Execution PMU: instructions=N cycles=N
-(7 rows)
+(9 rows)
 
 -- spec: explain-pmu/No plan
 CREATE TABLE nothing (a int);
@@ -279,6 +290,42 @@ SELECT * FROM pmu_explain($$
               pmu_explain               
 ----------------------------------------
  Result (actual rows=1.00 loops=1)
+ Planning PMU: instructions=N cycles=N
  Execution PMU: instructions=N cycles=N
+(3 rows)
+
+-- spec: explain-pmu/A query planned by EXPLAIN
+SELECT k, (j ->> k)::numeric > 0 AS positive
+FROM pmu_json($$EXPLAIN (ANALYZE, PMU, FORMAT JSON)
+                SELECT count(*) FROM small$$) j,
+     unnest(ARRAY['Planning Instructions', 'Planning Cycles']) k;
+           k           | positive 
+-----------------------+----------
+ Planning Instructions | t
+ Planning Cycles       | t
 (2 rows)
+
+-- spec: explain-pmu/A prepared statement
+-- The cache of prepared statements makes the plan, also during the
+-- EXPLAIN, and that planning is not counted.
+PREPARE count_small AS SELECT count(*) FROM small;
+SELECT * FROM pmu_explain($$
+  EXPLAIN (ANALYZE, PMU, COSTS off, TIMING off, SUMMARY off, BUFFERS off)
+  EXECUTE count_small$$);
+                      pmu_explain                      
+-------------------------------------------------------
+ Aggregate (actual rows=1.00 loops=1)
+   ->  Seq Scan on small (actual rows=1000.00 loops=1)
+ Execution PMU: instructions=N cycles=N
+(3 rows)
+
+SELECT * FROM pmu_explain($$
+  EXPLAIN (ANALYZE, PMU, COSTS off, TIMING off, SUMMARY off, BUFFERS off)
+  EXECUTE count_small$$);
+                      pmu_explain                      
+-------------------------------------------------------
+ Aggregate (actual rows=1.00 loops=1)
+   ->  Seq Scan on small (actual rows=1000.00 loops=1)
+ Execution PMU: instructions=N cycles=N
+(3 rows)
 

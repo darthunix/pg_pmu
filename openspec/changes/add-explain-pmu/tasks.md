@@ -81,7 +81,7 @@ with the lints of the design, and the commands each task names.
   an `EXCEPTION` block and one that counts after it. Add the use and
   what the counts include to the README. Verify with the suite on both
   builds.
-- [ ] 3.2 Count the planning in the hook of the planner, and show it
+- [x] 3.2 Count the planning in the hook of the planner, and show it
   only for a plan made in that EXPLAIN. Add to the suite a query
   planned by EXPLAIN, a prepared statement explained twice, and the
   properties of the planning in every format. Verify with the suite
