@@ -1,8 +1,12 @@
 # Builds and tests of pg_pmu: the suites on PostgreSQL 19 and master,
-# at the revisions of postgres.env, on Linux and on macOS on Apple
-# silicon; the checks of the crate; its models of loom; its proofs of
-# Kani. A runner that cannot count passes the suites with their second
-# expected outputs; the step "Expected outputs" says which matched.
+# at the revisions of postgres.env, on Linux on x86-64 and on AArch64
+# and on macOS on Apple silicon; the checks of the crate; its models of
+# loom; its proofs of Kani. Of the runners only the one of AArch64
+# Linux counts: there the suites must match their first expected
+# outputs, and the suites of a kernel that refuses and of workers that
+# cannot count run too. The x86-64 runner has no PMU and the macOS one
+# is a virtual machine; they pass the suites with their second expected
+# outputs, and the step "Expected outputs" says which matched.
 name: CI
 
 on:
@@ -18,12 +22,13 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-24.04, macos-15]
+        os: [ubuntu-24.04, ubuntu-24.04-arm, macos-15]
         postgres: ['19', MASTER]
     runs-on: ${{ matrix.os }}
     env:
       # The locale of the temporary servers of the suites.
       LANG: C.UTF-8
+      COUNTS: ${{ matrix.os == 'ubuntu-24.04-arm' }}
     steps:
       - uses: actions/checkout@v4
       - name: Revision
@@ -54,13 +59,17 @@ jobs:
         with:
           workspaces: crates/pg_pmu_core -> target
       - name: Checks of the crate
-        run: make check-crate
+        run: |
+          if [ "$COUNTS" = true ]; then export PG_PMU_REQUIRE_COUNTERS=1; fi
+          make check-crate
       - name: Build and install
         run: |
           make COPT=-Werror
           make install
       - name: Suites
-        run: make installcheck EXTRA_REGRESS_OPTS="--temp-instance=$RUNNER_TEMP/cluster"
+        run: |
+          if [ "$COUNTS" = true ]; then target=installcheck-counted; else target=installcheck; fi
+          make $target EXTRA_REGRESS_OPTS="--temp-instance=$RUNNER_TEMP/cluster"
       - name: Expected outputs
         if: always()
         run: |
@@ -82,12 +91,18 @@ jobs:
         run: make installcheck-vm EXTRA_REGRESS_OPTS="--temp-instance=$RUNNER_TEMP/cluster-vm"
       # At 4 an Ubuntu kernel refuses the events to every process
       # without privileges.
-      - name: Suite of a kernel that refuses (Linux)
-        if: runner.os == 'Linux'
+      - name: Suite of a kernel that refuses
+        if: env.COUNTS == 'true'
         run: |
           sudo sysctl -w kernel.perf_event_paranoid=4
           make installcheck-paranoid EXTRA_REGRESS_OPTS="--temp-instance=$RUNNER_TEMP/cluster-paranoid"
           sudo sysctl -w kernel.perf_event_paranoid=2
+      - name: Suite of workers that cannot count
+        if: env.COUNTS == 'true'
+        run: |
+          make PG_PMU_TEST=workers-cannot-count COPT=-Werror
+          make PG_PMU_TEST=workers-cannot-count install
+          make installcheck-workers-cannot-count EXTRA_REGRESS_OPTS="--temp-instance=$RUNNER_TEMP/cluster-workers"
       # Where the runner counts, the build without counters is the only
       # one that shows the second expected outputs.
       - name: Suites of the build without counters
