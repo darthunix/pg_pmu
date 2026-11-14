@@ -12,12 +12,6 @@
 regression.diffs
 regression.out
 
-# The workflow skills OpenSpec writes for a coding agent
-# (`openspec init --tools claude,codex`): made in each clone, not kept.
-/.agents/skills/.openspec-target
-/.agents/skills/openspec-*/
-/.claude/commands/opsx/
-/.claude/skills/openspec-*/
 /output_unloaded/
 /crates/pg_pmu_core/target/
 /.pmu_counters

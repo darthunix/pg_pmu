@@ -5,7 +5,9 @@ shows how many instructions and cycles of the processor one statement
 took, in the backend and in its parallel workers. It is meant for
 comparing two ways to run the same query by the work they do.
 
-It supports PostgreSQL 19 and master, on Linux and macOS.
+It supports PostgreSQL 19 and master, on Linux and macOS. How it is
+built and why, and which test shows each thing it does, is in
+[doc/design.md](doc/design.md).
 
 ## Building
 
