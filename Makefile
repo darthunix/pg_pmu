@@ -91,7 +91,7 @@ check-crate: $(RUST_LIB)
 		&& $(CARGO) clippy --all-targets && $(CARGO) test
 	@nm -u $(RUST_LIB) 2>/dev/null | awk \
 		'/^[^ \t].*\.o\)?:$$/ { crate = ($$0 ~ /pg_pmu_core/); seen += crate } \
-		 crate && $$NF ~ /^_?_(R[A-Za-z0-9]|ZN)/ { print; bad = 1 } \
+		 crate && $$NF ~ /^_?(_R[A-Za-z0-9]|_ZN|rust_eh_personality|_Unwind_)/ { print; bad = 1 } \
 		 END { if (!seen) { print "pg_pmu_core: no code of the crate in the archive"; exit 1 } \
 		       if (bad) { print "pg_pmu_core: the crate calls Rust code outside it"; exit 1 } }'
 
