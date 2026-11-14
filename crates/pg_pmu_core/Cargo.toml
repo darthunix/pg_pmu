@@ -1,0 +1,43 @@
+[package]
+name = "pg_pmu_core"
+version = "0.1.0"
+edition = "2024"
+license = "PostgreSQL"
+publish = false
+description = "The counters of the system and the shared cells of pg_pmu"
+
+[lib]
+# A static library for the module, and a library for the tests.
+crate-type = ["staticlib", "rlib"]
+
+[features]
+# The version that cannot count, on any system.
+none = []
+# The standard library, which only the tests use; see dev-dependencies.
+std = []
+
+[dependencies]
+libc = { version = "0.2.191", default-features = false }
+
+[dev-dependencies]
+# The tests build the crate with the standard library.
+pg_pmu_core = { path = ".", features = ["std"] }
+
+[profile.dev]
+panic = "abort"
+
+[profile.release]
+panic = "abort"
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(loom)", "cfg(kani)"] }
+unsafe_op_in_unsafe_fn = "deny"
+
+# A panic would abort a process of PostgreSQL, which restarts every
+# session, so the crate is written not to panic.
+[lints.clippy]
+panic = "deny"
+unwrap_used = "deny"
+expect_used = "deny"
+indexing_slicing = "deny"
+arithmetic_side_effects = "deny"

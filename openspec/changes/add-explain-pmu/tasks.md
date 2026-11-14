@@ -28,7 +28,7 @@ with the lints of the design, and the commands each task names.
 
 ## 2. The crate and the counters of one process
 
-- [ ] 2.1 Add the crate `crates/pg_pmu_core`: `no_std` except under
+- [x] 2.1 Add the crate `crates/pg_pmu_core`: `no_std` except under
   its tests, a static library and a library, `libc` without its
   default features, `Cargo.lock`, the lints against panics, and its
   build in the `Makefile`, with the feature `none` behind

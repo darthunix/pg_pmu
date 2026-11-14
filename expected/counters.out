@@ -1,0 +1,41 @@
+-- The counters of this system. A system that cannot count gives the
+-- second expected output, counters_1.out, where each counting EXPLAIN
+-- prints "cannot count".
+-- Run an EXPLAIN and return its lines, with the numbers of the lines of
+-- pg_pmu replaced by N, as they change from run to run; or one line
+-- when the system cannot count, whichever of its codes it fails with.
+CREATE FUNCTION pmu_explain(query text) RETURNS SETOF text
+LANGUAGE plpgsql AS $$
+DECLARE
+  line text;
+BEGIN
+  FOR line IN EXECUTE query LOOP
+    IF line ~ 'PMU:' THEN
+      line := regexp_replace(line, '[0-9]+', 'N', 'g');
+    END IF;
+    RETURN NEXT line;
+  END LOOP;
+EXCEPTION
+  WHEN insufficient_privilege OR feature_not_supported
+       OR insufficient_resources THEN
+    RETURN NEXT 'cannot count';
+END
+$$;
+-- spec: explain-pmu/Nothing runs
+-- Where the system cannot count, the statement fails before it runs:
+-- the sequence, which a rollback does not move back, is not advanced.
+CREATE SEQUENCE s;
+SELECT * FROM pmu_explain($$
+  EXPLAIN (ANALYZE, PMU, COSTS off, TIMING off, SUMMARY off, BUFFERS off)
+  SELECT nextval('s')$$);
+            pmu_explain            
+-----------------------------------
+ Result (actual rows=1.00 loops=1)
+(1 row)
+
+SELECT is_called FROM s;
+ is_called 
+-----------
+ t
+(1 row)
+
