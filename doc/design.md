@@ -18,8 +18,8 @@ instructions repeat almost exactly from run to run, while time and
 cycles vary much more (see [observations.md](observations.md)). The
 goals and limitations are in the [README](../README.md).
 
-This note explains how the module finds the statement, how it counts,
-how parallel workers report, and how all of it is tested.
+This note explains how the module counts one process, how it finds
+the statement, and how parallel workers report their part.
 
 ## The big picture
 
@@ -270,9 +270,13 @@ and the log says so.
 ```
 
 C keeps what talks to PostgreSQL. Rust keeps what can be tested
-without a server, which is why it exists: the cell protocol runs
-under loom, proptest and Kani, and the sysfs rules against generated
-machines (see Testing). C never touches a cell directly.
+without a server, which is why it exists. A bug in the cell protocol
+would show only in a rare order of events between processes, which
+SQL tests almost never hit. In Rust, loom runs every order of a few
+workers and a backend over the same code, proptest compares random
+sequences of steps with a simple model, and Kani proves that each step
+keeps a cell in a valid state. The sysfs rules run against generated
+machines. C never touches a cell directly.
 
 The crate is `no_std`, does not allocate and never panics: a panic
 would abort a PostgreSQL process and restart all sessions. Clippy
@@ -318,71 +322,3 @@ compile time.
 - On a hybrid Intel CPU we assume the kernel skips a pinned group on
   the other core type rather than putting it into the error state.
   This needs checking on such a machine.
-
-## Testing
-
-**SQL suites** run on a temporary server (`pg_pmu.conf`: preloaded,
-`max_nested = 2`). Counts change between runs, so the suites check
-facts, not values: positive, larger for more rows, the workers' part
-within the execution. Numbers in plans are masked. A system that
-cannot count prints "cannot count", and the suite `counters` has a
-second expected output for that.
-
-- `sql/option.sql`: the option, auto_explain, the setting
-  `pg_pmu.cell`, the size of the shared memory.
-- `sql/counters.sql`: counts, formats, planning, rules, prepared
-  statements, nesting, the pool, parallel workers and their failures.
-- `sql/unloaded.sql`: a server without the module.
-- `sql/paranoid.sql`: Linux refusing at `perf_event_paranoid` 4.
-- `sql/vm.sql`: a macOS virtual machine.
-- `sql/workers_cannot_count.sql`: a test build whose workers fail to
-  open their counters (`PG_PMU_TEST=workers-cannot-count`).
-
-The main cases are marked `-- case: <name>` in the suites.
-
-**Rust checks** in `crates/pmu_counters`: unit tests of the layout;
-proptest against simple models of the cells, of the sysfs rules over
-random machines and of the reference counting; loom models of workers
-reporting while a backend gives a cell back, takes it again or hands
-it down; Kani proofs that every step keeps the cell in a valid state
-and that tokens and their decimal form round-trip, and bounded proofs
-that the parsers of sysfs and of a counter read never panic (inputs of
-a few bytes; longer ones are left to proptest).
-
-Makefile targets for the special cases: `installcheck-counted` fails
-if a suite matched the "cannot count" output, and with
-`PG_PMU_REQUIRE_COUNTERS=1` the crate's tests fail where they cannot
-count; `installcheck-paranoid` and `installcheck-vm` run the suites of
-those systems; on a machine that counts, `make` and `make install`
-with `PG_PMU_TEST=workers-cannot-count`, then
-`installcheck-workers-cannot-count`, run the failing-worker suite
-(build and install again without `PG_PMU_TEST` afterwards);
-`PG_PMU_COUNTERS=none` builds a module that cannot count.
-
-**CI** builds PostgreSQL 19 and master on Linux x86-64, Linux AArch64
-and macOS. Where the kernel shows a hardware PMU (always on AArch64,
-on some x86-64 hosts) CI demands real counts and also runs the
-paranoid and failing-worker suites. macOS runners are virtual
-machines and run the VM suite. Every job also runs the suites of a
-build without counters (`PG_PMU_COUNTERS=none`). A separate workflow
-runs the observations of [observations.md](observations.md) on Linux.
-
-## Files
-
-```
- pg_pmu.c          the option, the hooks, frames, records, output
- workers.c         shared memory, pg_pmu.cell, holds, worker counting
- pg_pmu.h          what the two C files share
- pmu_counters.h    C declarations of the crate's functions
- test/abi.c        layout checks against the crate and the kernel
- crates/pmu_counters/
-   src/cells.rs    the cells: layout, token, steps, Kani proofs
-   src/counters/   Linux perf events, macOS rusage, references
-   src/sysfs.rs    core types and their CPUs
-   src/ffi.rs      the functions C calls
-   tests/          proptest models, loom models, real counters
- sql/, expected/   regression suites
- README.md         goals, limitations, use, build
- doc/observations.md  how stable the counts are, measured
- .github/          CI, observations, PostgreSQL build
-```

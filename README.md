@@ -118,8 +118,19 @@ make installcheck PG_CONFIG=/path/to/pg_config \
 ```
 
 The suites need auto_explain from the server's `contrib`. On a system
-that cannot count they match their second expected outputs. The other
-targets of the Makefile are in [doc/design.md](doc/design.md).
+that cannot count they match their second expected outputs. For the
+cases that need a machine of their own:
+
+- `make installcheck-counted` fails if the suites did not count, and
+  `PG_PMU_REQUIRE_COUNTERS=1` makes the crate's tests fail the same way;
+- `make installcheck-paranoid`: Linux with `kernel.perf_event_paranoid`
+  set to 4;
+- `make installcheck-vm`: a macOS virtual machine;
+- `make installcheck-workers-cannot-count`: on a machine that counts,
+  after `make` and `make install` with
+  `PG_PMU_TEST=workers-cannot-count`, whose workers fail to open their
+  counters; build and install again without it afterwards;
+- `PG_PMU_COUNTERS=none` builds a module that cannot count.
 
 ## License
 
