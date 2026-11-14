@@ -77,6 +77,9 @@ typedef struct PmuExplainState
 {
 	bool		pmu;			/* the option PMU is on */
 	PmuFrame   *frame;			/* its frame, once it counts */
+	PlannedStmt *planned;		/* the plan the planner made last, if any */
+	PmuCounts	plan_start;		/* the counts around that planning */
+	PmuCounts	plan_end;
 } PmuExplainState;
 
 /* The top of the stack of frames. */
@@ -381,11 +384,28 @@ pmu_find_record(QueryDesc *query)
 	return NULL;
 }
 
+/*
+ * The hook of the planner sees the state of the EXPLAIN that asked for
+ * the plan. When it counts, read the counters around the planner and
+ * keep the plan it made; the cache of prepared statements passes no
+ * state, so its planning is not counted.
+ */
 static PlannedStmt *
 pmu_planner(Query *parse, const char *query_string, int cursorOptions,
 			ParamListInfo boundParams, ExplainState *es)
 {
 	PlannedStmt *result;
+	PmuExplainState *state = NULL;
+	PmuCounts	start = {0};
+
+	if (es != NULL)
+	{
+		state = GetExplainExtensionState(es, pmu_extension_id);
+		if (state != NULL && (!state->pmu || state->frame == NULL))
+			state = NULL;
+	}
+	if (state != NULL)
+		pmu_read(&start);
 
 	pmu_depth++;
 	PG_TRY();
@@ -403,6 +423,12 @@ pmu_planner(Query *parse, const char *query_string, int cursorOptions,
 	}
 	PG_END_TRY();
 
+	if (state != NULL)
+	{
+		pmu_read(&state->plan_end);
+		state->plan_start = start;
+		state->planned = result;
+	}
 	return result;
 }
 
@@ -545,9 +571,9 @@ pmu_print(ExplainState *es, const char *phase, const PmuCounts *start,
 
 /*
  * The hook that runs for each plan after EXPLAIN ANALYZE has run and
- * printed it, before the executor ends: print the counts of the record of
- * this plan whose execution has not ended, then forget the frame's
- * records. It does nothing for an EXPLAIN without the option, and for the
+ * printed it, before the executor ends: print the counts of its planning,
+ * if this EXPLAIN planned it, and those of the record of this plan whose
+ * execution has not ended, then forget the frame's records. It does nothing for an EXPLAIN without the option, and for the
  * plans auto_explain logs.
  */
 static void
@@ -578,6 +604,9 @@ pmu_explain_per_plan(PlannedStmt *plannedstmt, IntoClause *into,
 				(errcode(ERRCODE_INTERNAL_ERROR),
 				 errmsg("pg_pmu found no counts of the plan it prints")));
 
+	if (state->planned == plannedstmt)
+		pmu_print(es, "Planning", &state->plan_start, &state->plan_end);
+	state->planned = NULL;
 	pmu_print(es, "Execution", &record->start, &record->finish);
 	state->frame->records = NULL;
 }

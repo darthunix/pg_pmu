@@ -173,3 +173,20 @@ SELECT * FROM pmu_explain($$
   EXPLAIN (ANALYZE, PMU, COSTS off, TIMING off, SUMMARY off, BUFFERS off)
   SELECT 1$$);
 
+-- spec: explain-pmu/A query planned by EXPLAIN
+SELECT k, (j ->> k)::numeric > 0 AS positive
+FROM pmu_json($$EXPLAIN (ANALYZE, PMU, FORMAT JSON)
+                SELECT count(*) FROM small$$) j,
+     unnest(ARRAY['Planning Instructions', 'Planning Cycles']) k;
+
+-- spec: explain-pmu/A prepared statement
+-- The cache of prepared statements makes the plan, also during the
+-- EXPLAIN, and that planning is not counted.
+PREPARE count_small AS SELECT count(*) FROM small;
+SELECT * FROM pmu_explain($$
+  EXPLAIN (ANALYZE, PMU, COSTS off, TIMING off, SUMMARY off, BUFFERS off)
+  EXECUTE count_small$$);
+SELECT * FROM pmu_explain($$
+  EXPLAIN (ANALYZE, PMU, COSTS off, TIMING off, SUMMARY off, BUFFERS off)
+  EXECUTE count_small$$);
+
