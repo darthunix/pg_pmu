@@ -34,3 +34,25 @@ SET auto_explain.log_extension_options = 'pmu';
 SET auto_explain.log_extension_options = 'pmu on';
 \set VERBOSITY default
 SET auto_explain.log_extension_options = 'pmu';
+
+-- spec: explain-pmu/The size at the start
+SELECT size = 16 + 32 * (current_setting('max_connections')::int
+                         + current_setting('autovacuum_worker_slots')::int
+                         + current_setting('max_worker_processes')::int
+                         + current_setting('max_wal_senders')::int + 2
+                         + current_setting('pg_pmu.max_nested')::int)
+       AS size_as_the_spec_says
+FROM pg_shmem_allocations WHERE name = 'pg_pmu';
+
+-- spec: explain-pmu/The setting of the module
+\set VERBOSITY sqlstate
+SET pg_pmu.cell = 1;
+RESET pg_pmu.cell;
+SELECT set_config('pg_pmu.cell', '1', false);
+SELECT set_config('pg_pmu.cell', NULL, false);
+CREATE FUNCTION set_cell() RETURNS int LANGUAGE sql
+  SET pg_pmu.cell = 1 AS 'SELECT 1';
+\set VERBOSITY default
+RESET ALL;
+SHOW pg_pmu.cell;
+SELECT count(*) AS listed FROM pg_settings WHERE name = 'pg_pmu.cell';

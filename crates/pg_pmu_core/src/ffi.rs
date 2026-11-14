@@ -8,6 +8,7 @@ use core::cell::UnsafeCell;
 use core::ffi::{CStr, c_char};
 use core::mem::{offset_of, size_of};
 
+use crate::cells::{self, Cell, Contents, Header, LOW_MASK};
 use crate::counters::{Counters, Counts, Platform, platform};
 use crate::{Error, Status};
 
@@ -61,6 +62,8 @@ pub struct PmuLayout {
     pub counts_size: u32,
     pub counts_cycles: u32,
     pub perf_abi_size: u32,
+    pub contents_size: u32,
+    pub contents_failures: u32,
 }
 
 /// Fill the layout of the shared types.
@@ -77,6 +80,8 @@ pub unsafe extern "C" fn pmu_core_layout(out: *mut PmuLayout) {
         counts_size: size_of::<Counts>() as u32,
         counts_cycles: offset_of!(Counts, cycles) as u32,
         perf_abi_size: size_of::<PmuPerfAbi>() as u32,
+        contents_size: size_of::<Contents>() as u32,
+        contents_failures: offset_of!(Contents, failures) as u32,
     };
     // SAFETY: see above.
     unsafe { out.write(layout) };
@@ -219,4 +224,169 @@ pub unsafe extern "C" fn pmu_counters_read(now: *mut Counts, os_error: *mut i32)
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn pmu_counters_release(os_error: *mut i32) -> i32 {
     finish(with_counters(|c| c.release()), os_error)
+}
+
+// ---------------------------------------------------------------------
+// The cells of the workers
+// ---------------------------------------------------------------------
+//
+// C allocates the memory "pg_pmu" and passes its address to each call;
+// the crate reads the numbers of cells from its header. The memory
+// lives as long as the server, and every process maps it.
+
+/// The code of a step on the cells.
+fn code(result: Result<(), Status>) -> i32 {
+    match result {
+        Ok(()) => Status::Ok as i32,
+        Err(s) => s as i32,
+    }
+}
+
+/// The cells of the backends and of the pool at `base`.
+///
+/// # Safety
+///
+/// `base` is null, or the address `pmu_cells_init` set up, which lives
+/// as long as the process.
+unsafe fn cells_at<'a>(base: *const u8) -> Result<(&'a [Cell], usize), Status> {
+    if base.is_null() {
+        return Err(Status::Internal);
+    }
+    // SAFETY: the header was written once, before any process used the
+    // memory, and is only read since.
+    let header = unsafe { &*base.cast::<Header>() };
+    let n = usize::try_from(header.n).map_err(|_| Status::Internal)?;
+    let k = usize::try_from(header.k).map_err(|_| Status::Internal)?;
+    let count = n.checked_add(k).ok_or(Status::Internal)?;
+    // SAFETY: the cells follow the header, `count` of them, aligned,
+    // and are atomic, so shared references to them may be used by
+    // every process at once.
+    let cells =
+        unsafe { core::slice::from_raw_parts(base.add(size_of::<Header>()).cast::<Cell>(), count) };
+    Ok((cells, n))
+}
+
+/// Take a cell with `take`, which gives its index and generation, and
+/// write its token. The pointer is checked first, so that no cell is
+/// taken whose token would be lost.
+fn take_into(out: *mut u64, take: impl FnOnce() -> Result<(u32, u64), Status>) -> i32 {
+    if out.is_null() {
+        return Status::Internal as i32;
+    }
+    code(take().map(|(index, g)| {
+        // SAFETY: C passes the address of a uint64_t.
+        unsafe { out.write(cells::token(index, g)) }
+    }))
+}
+
+/// The bytes of the memory for `n` cells of the backends and `k` of the
+/// pool, or 0 when their numbers do not fit in a token: N + K + 1 must
+/// fit in 20 bits.
+#[unsafe(no_mangle)]
+pub extern "C" fn pmu_cells_size(n: u32, k: u32) -> usize {
+    match u64::from(n).checked_add(u64::from(k)) {
+        Some(count) if count < LOW_MASK => cells::size(n, k).unwrap_or(0),
+        _ => 0,
+    }
+}
+
+/// Set up the memory: write the header and free cells.
+///
+/// # Safety
+///
+/// `base` is the address of `pmu_cells_size(n, k)` bytes, aligned to 8,
+/// that no process uses yet.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn pmu_cells_init(base: *mut u8, n: u32, k: u32) -> i32 {
+    let result = (|| {
+        if base.is_null()
+            || pmu_cells_size(n, k) == 0
+            || base.align_offset(core::mem::align_of::<Cell>()) != 0
+        {
+            return Err(Status::Internal);
+        }
+        // SAFETY: see above; nothing else reads the memory yet.
+        unsafe {
+            base.cast::<Header>().write(Header { n, k, zero: 0 });
+            let first = base.add(size_of::<Header>()).cast::<Cell>();
+            for i in 0..u64::from(n).wrapping_add(u64::from(k)) {
+                let i = usize::try_from(i).map_err(|_| Status::Internal)?;
+                first.add(i).write(Cell::default());
+            }
+        }
+        Ok(())
+    })();
+    code(result)
+}
+
+/// Take the cell of backend `index`, from 0 to N - 1, and write its
+/// token. A cell that is not free is an internal error: only its
+/// backend takes it.
+///
+/// # Safety
+///
+/// `base` as for `pmu_cells_init`, set up; `token` the address of a
+/// `uint64_t`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn pmu_cell_take(base: *const u8, index: u32, token: *mut u64) -> i32 {
+    take_into(token, || {
+        // SAFETY: see above.
+        let (cells, n) = unsafe { cells_at(base) }?;
+        let i = usize::try_from(index).map_err(|_| Status::Internal)?;
+        if i >= n {
+            return Err(Status::Internal);
+        }
+        let g = cells.get(i).and_then(Cell::take).ok_or(Status::Internal)?;
+        Ok((index, g))
+    })
+}
+
+/// Take a free cell of the pool and write its token; `PMU_NO_CELL`
+/// when none is free.
+///
+/// # Safety
+///
+/// As for `pmu_cell_take`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn pmu_cell_take_pool(base: *const u8, token: *mut u64) -> i32 {
+    take_into(token, || {
+        // SAFETY: see above.
+        let (cells, n) = unsafe { cells_at(base) }?;
+        let pool = cells.get(n..).ok_or(Status::Internal)?;
+        let (i, g) = cells::take_from_pool(pool).ok_or(Status::NoCell)?;
+        // The index fits: N + K is below 2^20, as the size checked.
+        let index = n.checked_add(i).and_then(|i| u32::try_from(i).ok());
+        index.map(|index| (index, g)).ok_or(Status::Internal)
+    })
+}
+
+/// Give back the cell of `token` and write what it held. Refused with
+/// `PMU_BAD_TOKEN` for a token that is not valid, `PMU_STALE_TOKEN`
+/// when the cell was given back already, and `PMU_CELL_BUSY` while a
+/// worker adds to it; a refused return changes nothing.
+///
+/// # Safety
+///
+/// `base` as for `pmu_cell_take`; `out` the address of a
+/// `PmuCellContents`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn pmu_cell_give_back(
+    base: *const u8,
+    token: u64,
+    out: *mut Contents,
+) -> i32 {
+    let result = (|| {
+        if out.is_null() {
+            return Err(Status::Internal);
+        }
+        // SAFETY: see above.
+        let (cells, _) = unsafe { cells_at(base) }?;
+        let count = u32::try_from(cells.len()).map_err(|_| Status::Internal)?;
+        let (i, g) = cells::split(token, count).ok_or(Status::BadToken)?;
+        let contents = cells.get(i).ok_or(Status::BadToken)?.give_back(g)?;
+        // SAFETY: C passes the address of a PmuCellContents.
+        unsafe { out.write(contents) };
+        Ok(())
+    })();
+    code(result)
 }

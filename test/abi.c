@@ -35,15 +35,22 @@ pmu_check_layout(void)
 	pmu_core_layout(&layout);
 	if (layout.counts_size != sizeof(PmuCounts) ||
 		layout.counts_cycles != offsetof(PmuCounts, cycles) ||
-		layout.perf_abi_size != sizeof(PmuPerfAbi))
+		layout.perf_abi_size != sizeof(PmuPerfAbi) ||
+		layout.contents_size != sizeof(PmuCellContents) ||
+		layout.contents_failures != offsetof(PmuCellContents, failures))
 		ereport(ERROR,
 				(errcode(ERRCODE_INTERNAL_ERROR),
 				 errmsg("pg_pmu_core.h does not match the crate pg_pmu_core"),
 				 errdetail("PmuCounts has %u bytes and cycles at %u, PmuPerfAbi "
-						   "%u bytes in the crate; %zu, %zu and %zu in the header.",
+						   "%u bytes, PmuCellContents %u bytes and failures at "
+						   "%u in the crate; %zu, %zu, %zu, %zu and %zu in the "
+						   "header.",
 						   layout.counts_size, layout.counts_cycles,
-						   layout.perf_abi_size, sizeof(PmuCounts),
-						   offsetof(PmuCounts, cycles), sizeof(PmuPerfAbi))));
+						   layout.perf_abi_size, layout.contents_size,
+						   layout.contents_failures, sizeof(PmuCounts),
+						   offsetof(PmuCounts, cycles), sizeof(PmuPerfAbi),
+						   sizeof(PmuCellContents),
+						   offsetof(PmuCellContents, failures))));
 }
 
 #ifdef __linux__

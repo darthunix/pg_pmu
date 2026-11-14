@@ -327,3 +327,58 @@ SELECT * FROM pmu_explain($$
  cannot count
 (1 row)
 
+-- Nested counting statements take cells of the pool, of which the
+-- server of the suite has two. nest(n) runs n of them, one inside the
+-- other.
+CREATE FUNCTION nest(depth int) RETURNS int
+LANGUAGE plpgsql AS $$
+BEGIN
+  IF depth > 0 THEN
+    EXECUTE format('EXPLAIN (ANALYZE, PMU) SELECT nest(%s)', depth - 1);
+  END IF;
+  RETURN depth;
+END
+$$;
+-- spec: explain-pmu/No free place
+\set VERBOSITY sqlstate
+EXPLAIN (ANALYZE, PMU, COSTS off, TIMING off, SUMMARY off, BUFFERS off)
+  SELECT nest(3);
+ERROR:  0A000
+\set VERBOSITY default
+SELECT * FROM pmu_explain($$
+  EXPLAIN (ANALYZE, PMU, COSTS off, TIMING off, SUMMARY off, BUFFERS off)
+  SELECT nest(2)$$);
+ pmu_explain  
+--------------
+ cannot count
+(1 row)
+
+-- A nested statement that fails inside two EXCEPTION blocks, the outer
+-- one catching its error, gives its cell back in the abort of the inner
+-- block: three in a row, then two nested at once, all find a cell.
+CREATE FUNCTION fail_nested() RETURNS int
+LANGUAGE plpgsql AS $$
+BEGIN
+  FOR i IN 1..3 LOOP
+    BEGIN
+      BEGIN
+        EXECUTE 'EXPLAIN (ANALYZE, PMU) SELECT 1 / 0';
+      EXCEPTION WHEN unique_violation THEN
+        NULL;
+      END;
+    EXCEPTION WHEN division_by_zero THEN
+      NULL;
+    END;
+  END LOOP;
+  EXECUTE 'EXPLAIN (ANALYZE, PMU) SELECT nest(1)';
+  RETURN 3;
+END
+$$;
+SELECT * FROM pmu_explain($$
+  EXPLAIN (ANALYZE, PMU, COSTS off, TIMING off, SUMMARY off, BUFFERS off)
+  SELECT fail_nested()$$);
+ pmu_explain  
+--------------
+ cannot count
+(1 row)
+

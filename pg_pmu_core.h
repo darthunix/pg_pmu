@@ -18,6 +18,7 @@
 #ifndef PG_PMU_CORE_H
 #define PG_PMU_CORE_H
 
+#include <stddef.h>
 #include <stdint.h>
 
 /* The codes; the SQLSTATE each one becomes is in the comment. */
@@ -51,6 +52,8 @@ typedef struct PmuLayout
 	uint32_t	counts_size;
 	uint32_t	counts_cycles;
 	uint32_t	perf_abi_size;
+	uint32_t	contents_size;
+	uint32_t	contents_failures;
 } PmuLayout;
 
 extern void pmu_core_layout(PmuLayout *out);
@@ -94,5 +97,45 @@ extern int32_t pmu_counters_open(int32_t *os_error);
 extern int32_t pmu_counters_acquire(PmuCounts *now, int32_t *os_error);
 extern int32_t pmu_counters_read(PmuCounts *now, int32_t *os_error);
 extern int32_t pmu_counters_release(int32_t *os_error);
+
+/*
+ * The cells of the memory "pg_pmu", where the parallel workers of a
+ * counting statement report; the layout and the token are in the spec.
+ * The module allocates the memory and passes its address to each call.
+ * These functions do not write os_error.
+ */
+
+/* What a cell held when it was given back. */
+typedef struct PmuCellContents
+{
+	uint64_t	instructions;
+	uint64_t	cycles;
+	uint32_t	failures;		/* workers that could not count */
+	uint32_t	sqlstate;		/* of the last of them */
+} PmuCellContents;
+
+/*
+ * The bytes of the memory for n cells of the backends and k of the pool,
+ * or 0 when their numbers do not fit in a token.
+ */
+extern size_t pmu_cells_size(uint32_t n, uint32_t k);
+
+/* Write the header and free cells, once, before any process uses them. */
+extern int32_t pmu_cells_init(void *base, uint32_t n, uint32_t k);
+
+/*
+ * Take the cell of backend index, or a cell of the pool (PMU_NO_CELL when
+ * none is free), and write its token.
+ */
+extern int32_t pmu_cell_take(const void *base, uint32_t index,
+							 uint64_t *token);
+extern int32_t pmu_cell_take_pool(const void *base, uint64_t *token);
+
+/*
+ * Give the cell of token back and write what it held. PMU_BAD_TOKEN,
+ * PMU_STALE_TOKEN and PMU_CELL_BUSY refuse it and change nothing.
+ */
+extern int32_t pmu_cell_give_back(const void *base, uint64_t token,
+								  PmuCellContents *out);
 
 #endif							/* PG_PMU_CORE_H */

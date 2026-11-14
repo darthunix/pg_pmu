@@ -114,7 +114,7 @@ with the lints of the design, and the commands each task names.
 
 ## 5. The parallel workers
 
-- [ ] 5.1 Add `workers.c`: the registration of the shared memory right
+- [x] 5.1 Add `workers.c`: the registration of the shared memory right
   after the check of initialization, handing its address, N and K to
   the crate; the setting `pg_pmu.cell` of the start of a connection, a
   string with the token, with its check and flags, saved by the frames
