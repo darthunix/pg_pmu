@@ -11,21 +11,22 @@ use core::mem::{offset_of, size_of};
 use crate::counters::{Counters, Counts, Platform};
 use crate::{Error, Status};
 
-/// State of one process.
-struct ProcessCell<T>(UnsafeCell<T>);
+/// The counters of this process.
+struct ProcessCounters(UnsafeCell<Counters<Platform>>);
 
 // SAFETY: a process of PostgreSQL calls the module, and so the crate,
 // from its one main thread only, and never from a signal handler; no
-// two calls run at once.
-unsafe impl<T> Sync for ProcessCell<T> {}
+// two calls run at once, and none calls back into another.
+unsafe impl Sync for ProcessCounters {}
 
-static COUNTERS: ProcessCell<Counters<Platform>> =
-    ProcessCell(UnsafeCell::new(Counters::new(Platform::new())));
+static COUNTERS: ProcessCounters = ProcessCounters(UnsafeCell::new(Counters::new(Platform::new())));
 
-fn counters() -> &'static mut Counters<Platform> {
-    // SAFETY: see ProcessCell; every function below takes this
-    // reference once and drops it before it returns.
-    unsafe { &mut *COUNTERS.0.get() }
+/// Run `f` with the counters of this process. The reference lives only
+/// as long as `f`, and `f` does not call back into this module.
+fn with_counters<R>(f: impl FnOnce(&mut Counters<Platform>) -> R) -> R {
+    // SAFETY: see ProcessCounters: no other reference to the counters
+    // exists while f runs.
+    f(unsafe { &mut *COUNTERS.0.get() })
 }
 
 /// Write the error of the system, if the pointer is not null, and
@@ -99,7 +100,7 @@ pub unsafe extern "C" fn pmu_counters_plan(
         }
         // SAFETY: C passes a string ending in zero.
         let sysfs = unsafe { CStr::from_ptr(sysfs) };
-        let n = counters().plan(sysfs)?;
+        let n = with_counters(|c| c.plan(sysfs))?;
         // SAFETY: C passes the address of a uint32_t.
         unsafe { descriptors.write(n) };
         Ok(())
@@ -115,7 +116,7 @@ pub unsafe extern "C" fn pmu_counters_plan(
 /// `os_error` is the address of an `int32_t`, or null.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn pmu_counters_open(os_error: *mut i32) -> i32 {
-    finish(counters().open(), os_error)
+    finish(with_counters(|c| c.open()), os_error)
 }
 
 /// Take a reference to the counters and read them.
@@ -130,7 +131,7 @@ pub unsafe extern "C" fn pmu_counters_acquire(now: *mut Counts, os_error: *mut i
         if now.is_null() {
             return Err(Error::new(Status::Internal));
         }
-        let counts = counters().acquire()?;
+        let counts = with_counters(|c| c.acquire())?;
         store(now, counts)
     })();
     finish(result, os_error)
@@ -147,7 +148,7 @@ pub unsafe extern "C" fn pmu_counters_read(now: *mut Counts, os_error: *mut i32)
         if now.is_null() {
             return Err(Error::new(Status::Internal));
         }
-        let counts = counters().read()?;
+        let counts = with_counters(|c| c.read())?;
         store(now, counts)
     })();
     finish(result, os_error)
@@ -160,5 +161,5 @@ pub unsafe extern "C" fn pmu_counters_read(now: *mut Counts, os_error: *mut i32)
 /// `os_error` is the address of an `int32_t`, or null.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn pmu_counters_release(os_error: *mut i32) -> i32 {
-    finish(counters().release(), os_error)
+    finish(with_counters(|c| c.release()), os_error)
 }

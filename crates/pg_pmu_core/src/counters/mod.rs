@@ -165,6 +165,8 @@ mod tests {
         enables: u32,
         disables: u32,
         fail_read: bool,
+        fail_enable: bool,
+        fail_disable: bool,
     }
 
     impl Backend for Fake {
@@ -175,6 +177,9 @@ mod tests {
             Ok(())
         }
         fn enable(&mut self) -> Result<(), Error> {
+            if self.fail_enable {
+                return Err(Error::os(Status::SystemError, 5));
+            }
             self.enabled = true;
             self.enables += 1;
             Ok(())
@@ -182,6 +187,9 @@ mod tests {
         fn disable(&mut self) -> Result<(), Error> {
             self.enabled = false;
             self.disables += 1;
+            if self.fail_disable {
+                return Err(Error::os(Status::SystemError, 5));
+            }
             Ok(())
         }
         fn read(&mut self) -> Result<Counts, Error> {
@@ -228,5 +236,28 @@ mod tests {
         assert_eq!(c.acquire().unwrap_err().status, Status::CounterLost);
         assert_eq!(c.refs(), 0);
         assert!(!c.backend().enabled);
+    }
+
+    #[test]
+    fn failed_enable_takes_no_reference() {
+        let mut c = Counters::new(Fake {
+            fail_enable: true,
+            ..Fake::default()
+        });
+        c.open().unwrap();
+        assert_eq!(c.acquire().unwrap_err().status, Status::SystemError);
+        assert_eq!(c.refs(), 0);
+    }
+
+    #[test]
+    fn reference_is_given_back_when_disabling_fails() {
+        let mut c = Counters::new(Fake {
+            fail_disable: true,
+            ..Fake::default()
+        });
+        c.open().unwrap();
+        c.acquire().unwrap();
+        assert_eq!(c.release().unwrap_err().status, Status::SystemError);
+        assert_eq!(c.refs(), 0);
     }
 }

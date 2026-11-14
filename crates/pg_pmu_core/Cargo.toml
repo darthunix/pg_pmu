@@ -17,7 +17,7 @@ none = []
 std = []
 
 [dependencies]
-libc = { version = "0.2.191", default-features = false }
+libc = { version = "0.2", default-features = false }
 
 [dev-dependencies]
 # The tests build the crate with the standard library.
@@ -34,10 +34,14 @@ unexpected_cfgs = { level = "warn", check-cfg = ["cfg(loom)", "cfg(kani)"] }
 unsafe_op_in_unsafe_fn = "deny"
 
 # A panic would abort a process of PostgreSQL, which restarts every
-# session, so the crate is written not to panic.
+# session, so the crate is written not to panic; "make check-crate"
+# also looks for panics in the archive the module links.
 [lints.clippy]
 panic = "deny"
 unwrap_used = "deny"
 expect_used = "deny"
 indexing_slicing = "deny"
 arithmetic_side_effects = "deny"
+unreachable = "deny"
+todo = "deny"
+unimplemented = "deny"

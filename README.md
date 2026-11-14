@@ -21,8 +21,12 @@ make install PG_CONFIG=/path/to/pg_config
 Cargo fetches the crate's dependencies from crates.io, at the versions
 of `Cargo.lock`. To build without the network, run `cargo vendor` in
 `crates/pg_pmu_core` beforehand and point Cargo at the sources it
-writes, as it prints. `make PG_PMU_COUNTERS=none` builds a version that
-cannot count, as on any system other than Linux and macOS.
+writes, as it prints. Cargo runs only when a source of the crate has
+changed, so `make install` after `make` runs none. `make
+PG_PMU_COUNTERS=none` builds a version that cannot count, as on any
+system other than Linux and macOS; give `make install` the same
+setting. `make clean` keeps the crate's target directory; `cargo clean`
+in the crate removes it.
 
 The crate never panics on purpose: a panic would abort the process of
 PostgreSQL, and the server would restart every session.
@@ -60,10 +64,11 @@ auto_explain cannot use it, as it explains a plan after it has run.
 
 ## Testing
 
-The crate has its own tests:
+The crate has its own checks, with Clippy and a look for panics in
+the archive the module links:
 
 ```sh
-cd crates/pg_pmu_core && cargo test && cargo clippy --all-targets
+make check-crate PG_CONFIG=/path/to/pg_config
 ```
 
 The suites of SQL start temporary servers of their own:
@@ -76,7 +81,9 @@ make installcheck PG_CONFIG=/path/to/pg_config \
 The suite `option` uses auto_explain, so the server's `contrib` must
 be installed. On a system that cannot count, the suites match their
 second expected outputs, where each counting EXPLAIN prints "cannot
-count".
+count". On a machine that must count, `make installcheck-counted`
+fails if a suite matched one of those, and `PG_PMU_REQUIRE_COUNTERS=1`
+makes the crate's tests fail where they cannot count.
 
 ## License
 
