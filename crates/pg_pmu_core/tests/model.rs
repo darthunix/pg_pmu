@@ -667,11 +667,12 @@ fn groups_are_added() {
 use pg_pmu_core::cells::{self, Cell, Contents, EMPTYING, G_MASK, LOW_MASK};
 
 /// Which generation an operation uses: the last one taken, one taken
-/// before, or any number.
+/// before, the last with one of its 44 bits flipped, or any number.
 #[derive(Clone, Debug)]
 enum Gen {
     Last,
     Old(usize),
+    Flip(u32),
     Any(u64),
 }
 
@@ -693,6 +694,7 @@ fn gen_sel() -> impl Strategy<Value = Gen> {
     prop_oneof![
         3 => Just(Gen::Last),
         1 => any::<usize>().prop_map(Gen::Old),
+        1 => (0u32..44).prop_map(Gen::Flip),
         1 => (0..=G_MASK).prop_map(Gen::Any),
     ]
 }
@@ -809,6 +811,7 @@ proptest! {
             let pick = |sel: &Gen| match *sel {
                 Gen::Last => taken.last().copied().unwrap_or(0),
                 Gen::Old(i) => taken[i % taken.len()],
+                Gen::Flip(bit) => taken.last().copied().unwrap_or(0) ^ (1 << bit),
                 Gen::Any(g) => g,
             };
             match op {
@@ -881,7 +884,8 @@ proptest! {
     }
 
     #[test]
-    fn decimal_forms_are_refused_as_the_rule_says(text in "[0-9+ a-]{0,24}") {
+    fn decimal_forms_are_refused_as_the_rule_says(
+        text in prop_oneof!["[0-9+ a-]{0,24}", "[0-9]{19,24}", "[1-9][0-9]{19}"]) {
         let want = if !text.is_empty() && text.bytes().all(|b| b.is_ascii_digit()) {
             text.parse::<u64>().map_err(|_| Malformed)
         } else {
