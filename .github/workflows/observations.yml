@@ -1,0 +1,86 @@
+# The observations of the README on the runners of Linux, which count:
+# PostgreSQL master without assertions, Tessera's release build, and
+# the statements of .github/scripts/observe.sh. It runs when its files
+# change, or by hand. A runner is a virtual machine shared with others,
+# so its spread is wider than that of an idle machine.
+name: Observations
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - .github/workflows/observations.yml
+      - .github/scripts/observe.sh
+
+permissions:
+  contents: read
+
+jobs:
+  observe:
+    name: Observations (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04-arm, ubuntu-24.04]
+    runs-on: ${{ matrix.os }}
+    env:
+      LANG: C.UTF-8
+      # The revision of Tessera the README's observations name.
+      TESSERA: 2cea4ceaaa07b9f0efe746bffd07a5c731e83452
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          repository: darthunix/tessera
+          ref: ${{ env.TESSERA }}
+          path: tessera
+      - name: Revision
+        id: revision
+        run: |
+          . .github/postgres.env
+          echo "revision=$POSTGRES_MASTER" >> "$GITHUB_OUTPUT"
+          echo "PG_CONFIG=$HOME/postgres-release/bin/pg_config" >> "$GITHUB_ENV"
+          echo "$HOME/postgres-release/bin" >> "$GITHUB_PATH"
+      - name: Build tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq bison flex zlib1g-dev
+      - uses: actions/cache@v4
+        id: postgres
+        with:
+          path: ~/postgres-release
+          key: postgres-release-${{ runner.os }}-${{ runner.arch }}-${{ steps.revision.outputs.revision }}-${{ hashFiles('.github/scripts/build-postgres.sh') }}
+      - name: Build PostgreSQL without assertions
+        if: steps.postgres.outputs.cache-hit != 'true'
+        run: .github/scripts/build-postgres.sh ${{ steps.revision.outputs.revision }} "$HOME/postgres-release" release
+      - name: Build and install Tessera and pg_pmu
+        run: |
+          (cd tessera && rustup toolchain install && make && make install)
+          make && make install
+      - name: The machine
+        run: |
+          lscpu | grep -E 'Model name|^CPU\(s\)|Vendor'
+          uname -r
+          sudo sysctl -w kernel.perf_event_paranoid=2
+      - name: A server
+        run: |
+          initdb -D "$RUNNER_TEMP/data" -U postgres > /dev/null
+          cat >> "$RUNNER_TEMP/data/postgresql.conf" <<CONF
+          shared_preload_libraries = 'tessera, tessera_nodes, tessera_kernels, pg_pmu'
+          unix_socket_directories = '$RUNNER_TEMP'
+          listen_addresses = ''
+          CONF
+          pg_ctl -D "$RUNNER_TEMP/data" -l "$RUNNER_TEMP/log" -w start
+          echo "PGHOST=$RUNNER_TEMP" >> "$GITHUB_ENV"
+          echo "PGUSER=postgres" >> "$GITHUB_ENV"
+          echo "PGDATABASE=postgres" >> "$GITHUB_ENV"
+      - name: The table
+        run: |
+          psql -X -q -c "CREATE EXTENSION tessera" \
+            -c "CREATE TABLE t AS SELECT g FROM generate_series(1, 100000) g" \
+            -c "VACUUM ANALYZE t"
+      - name: Observations
+        run: .github/scripts/observe.sh
+      - name: The server's log
+        if: failure()
+        run: tail -n 50 "$RUNNER_TEMP/log" || true
