@@ -1,16 +1,15 @@
-# Design
+# pg_pmu: architecture and design
 
-## Context
+`pg_pmu` is a module of PostgreSQL 19 and master that adds the option
+`PMU` to EXPLAIN ANALYZE. With it, EXPLAIN shows how many instructions
+and cycles of the processor one statement took, in the backend and in
+its parallel workers, so that two ways to run the same query can be
+compared by their work. This document says what the module does, how
+it is built and why, and which tests show it. The module is written in
+C, with the cells of its shared memory and its counters of the system
+in a Rust crate, `pg_pmu_core`.
 
-`pg_pmu` adds the option `PMU` to EXPLAIN ANALYZE. With it, EXPLAIN
-shows how many instructions and cycles of the processor one statement
-took, in the backend and in its parallel workers. Its first use is to
-compare two executors of the same query by their work. What the module
-promises is in specs/explain-pmu/spec.md. The module is written in C,
-with the cells of its shared memory and its counters of the system in
-a Rust crate.
-
-The module needs these things from PostgreSQL. All of them are in
+The module needs these things from PostgreSQL, all of them in
 PostgreSQL 19 and in master, with the same signatures:
 
 - an extension can add an option to EXPLAIN, keep its own state in the
@@ -26,9 +25,7 @@ PostgreSQL 19 and in master, with the same signatures:
 - a module in `shared_preload_libraries` can request shared memory
   of a fixed size when the server starts.
 
-## Goals / Non-Goals
-
-**Goals:**
+## Goals
 
 - Counts of one statement, the parallel workers included, in the
   output of EXPLAIN ANALYZE.
@@ -39,7 +36,7 @@ PostgreSQL 19 and in master, with the same signatures:
   size known before the start of the server.
 - Counts that are right or an error, never a plausible wrong number.
 
-**Non-Goals:**
+Left out on purpose:
 
 - Counts for each node of the plan. Two reads of the counters for each
   row of each node would cost more than the work of many nodes, and
@@ -47,7 +44,169 @@ PostgreSQL 19 and in master, with the same signatures:
 - A table of statistics over many statements in shared memory.
 - Systems other than Linux and macOS.
 
-## Decisions
+## What pg_pmu does
+
+### Loading the module
+
+`pg_pmu` is loaded with `shared_preload_libraries`, so adding it needs a
+restart of the server. It needs no `CREATE EXTENSION`. Every process of
+the server, the parallel workers included, then has the module. Started
+any other way, as by `LOAD` or by `session_preload_libraries` on a
+server that does not preload it, the module fails with SQLSTATE 55000
+and a message that names `shared_preload_libraries`; with
+`session_preload_libraries` this fails every new connection that has the
+setting. A `LOAD` of the module on a server that preloads it does
+nothing.
+
+### The option PMU
+
+`PMU` is a boolean option of EXPLAIN. It takes the same values as the
+boolean options of PostgreSQL itself, and it is off when not given. It
+is refused without `ANALYZE`, with SQLSTATE 22023 and the message
+"EXPLAIN option PMU requires ANALYZE". When it is off, the output is the
+same as without `pg_pmu`. The setting
+`auto_explain.log_extension_options` refuses `pmu`: auto_explain
+explains a plan after it has run, when nothing was counted.
+
+### Counts of the execution
+
+The output shows two numbers for the execution of the statement.
+Instructions are the instructions the processor completed; work it
+started on a guess and threw away is not counted. Cycles are the clock
+cycles of the cores while they ran that work. Both cover:
+
+- in the backend, the start of the execution, its run and its AFTER
+  triggers;
+- in each parallel worker that runs a plan for the statement, the
+  start of that execution and its run;
+- every function and query the statement runs inside, in the backend
+  and in the workers;
+- the work a worker did before it failed, when the statement goes on
+  after the failure, as a function that catches an error does.
+
+They do not cover the end of the statement's own execution, in the
+backend and in each worker, where the executor frees its resources; the
+ends of the queries it runs inside are covered. Nor do they cover the
+start of the worker processes, the queries a worker runs outside its
+execution of the plan, and workers that run no plan of a query, such as
+those of a parallel index build, even when they call functions that run
+queries. They include the work EXPLAIN ANALYZE itself does to measure
+each node of the plan; with `TIMING off` that work is smaller.
+
+### Counts of the planning
+
+When the planner made the plan for this EXPLAIN, the output also shows
+the instructions and cycles of that planning, in the backend. When the
+plan came through the cache of prepared statements, as with `EXPLAIN
+EXECUTE`, the output shows no counts of planning. This holds even when
+the cache makes or remakes the plan during this EXPLAIN; that planning
+is counted nowhere.
+
+### The output
+
+In the text format the counts are lines of the form `Planning PMU:
+instructions=<n> cycles=<n>` and `Execution PMU: instructions=<n>
+cycles=<n>`. In the formats JSON and YAML they are integer properties of
+the query: "Planning Instructions", "Planning Cycles", "Execution
+Instructions" and "Execution Cycles". In XML they are elements of the
+query with the same names, the spaces replaced by hyphens, as PostgreSQL
+does for all its names: `Planning-Instructions` and so on. They come
+after the plan, the triggers, JIT and serialization, and before
+"Execution Time", whatever `SUMMARY` says. When one EXPLAIN shows
+several plans, as with a rule, each plan has its own counts. A statement
+that ends with no plan, such as one a rule turns into nothing, shows no
+counts.
+
+### The part of the parallel workers
+
+Each parallel worker counts its own execution of a plan once, with the
+queries it runs inside, and adds it to the counts of the statement it
+works for. The workers of a statement that does not count do not count,
+even while a function they wait on runs a statement that does. A
+statement that a parallel worker runs has no workers of its own and no
+part of the workers.
+
+With `VERBOSE`, when at least one worker counted, the output also shows
+the part of the workers: in the text format the line `Workers PMU:
+instructions=<n> cycles=<n>`, in JSON and YAML the integer properties
+"Workers Instructions" and "Workers Cycles", in XML the elements
+`Workers-Instructions` and `Workers-Cycles`. It is shown also when
+EXPLAIN hides the Gather, as with `debug_parallel_query` set to
+`regress`. This part is included in the counts of the execution.
+
+### Nested counting statements
+
+A counting statement that starts while another counting statement of the
+same backend runs is nested. It counts the workers of its own plans and
+of the queries it runs, and does not count the workers of the outer
+statement, also when it starts inside a parallel plan of the outer one,
+from a function the backend runs above a Gather. The outer statement
+includes all the work of the nested one, its workers too, also when the
+nested one fails and a function catches the error, and when several
+nested statements fail together and the error is caught around all of
+them.
+
+The setting `pg_pmu.max_nested`, an integer from 0 to 1024, 16 by
+default, takes effect only at the start of the server. It is the number
+of nested statements the whole server can run at once. A nested
+statement that finds all of them in use fails with SQLSTATE 53000 before
+it runs.
+
+The module keeps the setting `pg_pmu.cell` for its own use, to tell the
+workers where to report: its value is the token of a cell, as the
+section on the layout of the shared memory says, or 0 when the statement
+does not count. A session cannot change it: `SET` and `RESET` of it fail
+with SQLSTATE 55P02, and so does making a function with a `SET` clause
+for it; `RESET ALL` leaves it; a value given at connection start fails
+with SQLSTATE 22023.
+
+### Counting on each system
+
+On Linux `pg_pmu` counts with the kernel's performance events of the
+thread that runs each process, in user space only. The work of the
+kernel for the process and of threads a library starts is not counted. A
+successful opening and reading of the events decides whether the module
+counts. The usual conditions are `kernel.perf_event_paranoid` of 2 or
+less, or the capability `CAP_PERFMON` or `CAP_SYS_ADMIN` of the server's
+processes. Some distributions add values above 2 that refuse processes
+without privileges, and the filters of system calls in containers and
+the security modules can refuse too. On a processor with several kinds
+of cores it counts on all of them; it finds the kinds in sysfs and fails
+with SQLSTATE 0A000 when they do not cover all the processors online
+when it opens the counters, or when the kernel cannot open an event on
+one kind of cores: on Intel that needs Linux 5.13 or later, on Arm a
+later kernel.
+
+On macOS `pg_pmu` counts with the counters the kernel keeps for each
+process: all its threads, user space and kernel together. It needs no
+privileges. When the kernel reports no instructions for the process, as
+in a virtual machine, it fails with SQLSTATE 0A000. Counts from Linux
+and from macOS mean different things and are not comparable.
+
+### When the system cannot count
+
+The backend opens its counters when EXPLAIN has read its options. When
+it cannot count, the statement fails before it runs, with one of these
+SQLSTATEs:
+
+- 42501: the system does not allow the process to count;
+- 0A000: the process cannot count here: a virtual machine without
+  counters, a system other than Linux and macOS, or kinds of cores
+  that cannot all be counted;
+- 53000: no hardware counter is free, no file descriptor is left, or
+  no place is free for a nested statement.
+
+Two failures come later, after a part of the statement has run. A
+parallel worker that cannot count fails with the same error, and so does
+the statement. On Linux, a counter that the system takes away while the
+statement runs fails the statement with SQLSTATE 53000 at its end. A
+function may catch the error of a worker that could not count; a
+counting statement around it still fails at its end, with the same
+SQLSTATE, rather than show counts without that worker. An ordinary error
+of a worker is not such a failure: what the worker did until then is
+counted. In all these cases the next statement counts again.
+
+## How it is built
 
 ### The work of one EXPLAIN
 
@@ -87,14 +246,13 @@ The counts belong to one statement that the user runs on purpose, and
 EXPLAIN ANALYZE is where PostgreSQL shows what one run cost. An option
 keeps the cost at zero when it is not given.
 
-The module is loaded with `shared_preload_libraries`, by the
-maintainer's decision. So it requests its shared memory when the
-server starts, with a size it knows then, and `pg_pmu.max_nested` can
-be a setting of the start: PostgreSQL lets a module define such a
-setting only while it loads the modules of the start. Every process of
-the server is forked from the postmaster with the module already
-loaded, so all of them run the same version of it, and the memory
-needs no mark of its version.
+The module is loaded with `shared_preload_libraries`. So it requests its
+shared memory when the server starts, with a size it knows then, and
+`pg_pmu.max_nested` can be a setting of the start: PostgreSQL lets a
+module define such a setting only while it loads the modules of the
+start. Every process of the server is forked from the postmaster with
+the module already loaded, so all of them run the same version of it,
+and the memory needs no mark of its version.
 
 The first thing the module's initialization does is to check that the
 server is loading the modules of the start, and to fail with 55000
@@ -211,7 +369,7 @@ before that execution, and a worker of a parallel index build runs
 the queries of its functions with no plan of a query around them.
 Neither is counted.
 
-### Counts of the planning
+### The window of the planning
 
 The hook of the planner sees the state of the EXPLAIN. When it has the
 option on, the hook reads the counters around the planner and keeps
@@ -226,7 +384,7 @@ workers.
 
 The backend and its workers are separate processes, and each counts
 only itself. Each counting statement has a cell in the shared memory
-"pg_pmu" (the layout is in the spec), and its workers add to that
+"pg_pmu" (its layout is below), and its workers add to that
 cell. The setting `pg_pmu.cell` tells a worker which cell it is.
 
 PostgreSQL lets a backend that already runs a parallel plan start
@@ -501,8 +659,8 @@ it again in the backend. When a function catches that error, the
 recorded failure still fails the statement around it at its finish.
 An ordinary error of a worker is not a failure to count: its exit
 callback adds what it counted, and the statement around a function
-that catches the error goes on with complete counts. The codes are in
-the spec.
+that catches the error goes on with complete counts. The codes are
+those of the section "When the system cannot count" above.
 
 ### Settings of auto_explain
 
@@ -528,6 +686,77 @@ The pool is one for the whole server, not one for each backend: a
 nested counting statement is rare, and a pool for each backend would
 cost N times as much. A session can hold cells of the pool only while
 its nested statements run.
+
+#### The layout
+
+The module requests its shared memory when the server starts,
+under the name "pg_pmu", and its size does not change while the
+server runs. It holds one cell for each backend the server can run at
+once, by the number PostgreSQL gives the backend, and a pool of
+`pg_pmu.max_nested` cells for nested statements:
+
+```
+"pg_pmu": 16 + 32 * (N + K) bytes
+N: the backends the server can run at once
+K: pg_pmu.max_nested
+
+offset        size    field
+0             4       N
+4             4       K
+8             8       zero
+16            32 * N  cells of the backends, cell i of backend i
+16 + 32 * N   32 * K  cells of the pool
+
+Cell: 32 bytes
+
+offset  size  field
+     0     8  instructions of the workers, summed
+     8     8  cycles of the workers, summed
+    16     8  state: the generation G in bits 20 to 63,
+              the writers W in bits 0 to 19
+    24     4  workers that could not count, counted
+    28     4  SQLSTATE of the last of them
+
+Token: a 64-bit number, written in decimal as the value of
+pg_pmu.cell; 0 for no cell
+
+bit     63 ... 20    19 ... 0
+        G            number of the cell + 1
+```
+
+N is the number PostgreSQL computes for the backends; in PostgreSQL 19
+and master it is the sum of `max_connections`,
+`autovacuum_worker_slots`, `max_worker_processes`, `max_wal_senders`
+and 2. PostgreSQL allows fewer than 2^18 backends and fewer than 2^18
+workers, so N + K + 1 and the largest W fit in 20 bits, and G has 44.
+All the fields of a cell are atomic integers; the module does not
+build where the processor has no native 64-bit atomics.
+
+The state of a cell is one of these three:
+
+- G even and W 0: the cell is free. The cell of a backend is taken by
+  its outermost counting statement, a cell of the pool by a nested
+  one.
+- G odd and W below 2^20 - 1: the cell is taken, and W workers are
+  adding to it at this moment.
+- G even and W 2^20 - 1: the cell is being emptied into the statement
+  around it; nobody may add to it or take it.
+
+G counts modulo 2^44. A token is valid when its number of the cell is
+from 1 to N + K and its G is odd; its decimal form has digits only,
+with no sign or spaces, and is below 2^64. A report is accepted only
+with a valid token whose G, all 44 bits of it, equals the G of the
+cell, and only while W stays below 2^20 - 1. Any other report is
+refused, add nothing, and fail the worker with SQLSTATE XX000, rather
+than add to a cell that another statement may hold.
+
+A cell that a worker is still adding to is not returned: that is
+an internal error of the module, which fails the statement with
+SQLSTATE XX000, or, when the statement is already failing, leaves the
+cell taken until the server restarts and writes a warning to the log.
+When that cell is the cell of a backend, every later outermost
+counting statement of a backend with that number fails with
+SQLSTATE XX000 before it runs, until the restart.
 
 ### The Rust part
 
@@ -603,7 +832,7 @@ short reads. In Rust these tools reach them:
   exactly, and only valid ones are accepted; its decimal form, for
   every string of up to 20 bytes, is read back to the same number or
   refused; each step, for every state word, leads from a state the
-  spec allows to another one it allows, or refuses, with the
+  layout allows to another one it allows, or refuses, with the
   generation wrapping modulo 2^44; a number of a list of processors,
   for every input of up to 12 bytes, is read without overflow and only
   when it is digits; the parser of a whole list, for every input of up
@@ -641,7 +870,7 @@ README says what a panic would mean.
 The crate refuses to build where the target has no 64-bit atomics,
 which takes the place of the check on PostgreSQL's atomics; the
 module does not use those at all. Its types are `#[repr(C)]`, and its
-tests check their sizes and offsets against the layout in the spec.
+tests check their sizes and offsets against the layout below.
 On the processors the module supports, x86-64 and AArch64, the atomic
 instructions behave on memory shared between processes as between
 threads, so a model with threads checks the same protocol. On Linux
@@ -657,14 +886,14 @@ events from crates.io. The module needs pinned groups in user space,
 one for each kind of cores, with their error state checked; the
 system calls for that are few, and `libc` has the call itself.
 
-## What we do not do
+## What it does not do
 
 - Counts without EXPLAIN. The counts include the work EXPLAIN ANALYZE
   does to measure each node, about a few dozen instructions for each
   row of each node. It weighs on an executor that passes rows one by
   one more than on one that passes them in batches. A way to count a
-  statement run without EXPLAIN would remove it. The maintainer
-  decided not to build it: the bias is accepted and documented.
+  statement run without EXPLAIN would remove it. It was decided
+  not to build it: the bias is accepted and documented.
 - More nested counting statements at once than `pg_pmu.max_nested`.
   They fail with 53000, and the setting can be raised before the next
   start.
@@ -679,7 +908,7 @@ system calls for that are few, and `libc` has the call itself.
 - Other events of the processor, such as misses of the caches or
   branches. They can be added to the same group later.
 
-## Risks / Trade-offs
+## Risks
 
 - [The machines of CI may have no counters: virtual machines often
   give none to processes.] → The suite prints one line for any system
@@ -694,8 +923,8 @@ system calls for that are few, and `libc` has the call itself.
   previous one.] → The module calls the previous hooks, as every
   extension must; a plan without its record fails the statement with
   an internal error rather than show wrong numbers.
-- [The counts include the instrumentation of EXPLAIN ANALYZE.] → The
-  spec and the README say so, and recommend `TIMING off`.
+- [The counts include the instrumentation of EXPLAIN ANALYZE.] → This
+  document and the README say so, and recommend `TIMING off`.
 - [On a processor with two kinds of cores, the group of one kind is
   pinned while the thread runs on the other kind. The design assumes
   the kernel skips it there, as perf's filter of units does, rather
@@ -706,79 +935,43 @@ system calls for that are few, and `libc` has the call itself.
   pool taken until a restart.] → The tests return a cell after a
   failed nested statement and take it again.
 
-## Decisions of the maintainer
+## Decisions
 
-- 2026-11-14: a separate repository, `pg_pmu`; counts of one statement
+- a separate repository, `pg_pmu`; counts of one statement
   in EXPLAIN ANALYZE rather than columns of pg_stat_kcache in a table
   in shared memory; counts of the whole statement, not of its nodes.
-- 2026-11-14: no counting without EXPLAIN; the PostgreSQL License.
-- 2026-11-14: parallel plans are counted with no refusal, statements
+- no counting without EXPLAIN; the PostgreSQL License.
+- parallel plans are counted with no refusal, statements
   started inside a parallel plan included.
-- 2026-11-14: the module lives in `shared_preload_libraries`; the
+- the module lives in `shared_preload_libraries`; the
   number of nested counting statements is a setting fixed before the
   start; memory of a fixed size, a cell for each backend and a pool
   for the nested statements.
-- 2026-11-14: cells have generations, and a report with an old token
+- cells have generations, and a report with an old token
   is refused; the layout and the steps on it are in Rust, checked with
   loom, proptest and Kani; C keeps the allocation of the memory and
   the work inside PostgreSQL.
-- 2026-11-14: the counters of the system are in the Rust crate too,
+- the counters of the system are in the Rust crate too,
   with their own checks; the generation has 44 bits, and the token is
-  a 64-bit number in a string setting. The maintainer kept the token
+  a 64-bit number in a string setting. The token
+  was kept
   and the writers over a simpler scheme without them, which would let
   a fault of the module through in two narrow windows.
-
-## Files
-
-- `Makefile`: the PGXS build of the module and its suite, with the
-  crate built by Cargo and linked in; the variable
-  `PG_PMU_COUNTERS=none` builds the crate with the feature `none`, the
-  version that cannot count, and `PG_PMU_TEST=workers-cannot-count`
-  the module whose parallel workers cannot count, for its suite.
-- `crates/pg_pmu_core/`: the crate. `src/cells.rs`: the layout, the
-  token and the steps. `src/counters/mod.rs`: the references;
-  `perf.rs`: the groups of perf events over the calls of the system;
-  `linux.rs`: those calls on Linux; `perf_abi.rs`: the few
-  declarations of Linux's perf events; `macos.rs`, `none.rs`: the
-  other systems. `src/sysfs.rs`: the kinds of cores and their
-  coverage. `src/ffi.rs`: the functions C calls. The proofs of Kani
-  are beside the code they prove. `tests/model.rs`: the tests of
-  proptest against the plain models; `tests/loom.rs`: the models of
-  loom; `tests/counters.rs`: the tests on real counters; `tests/abi.rs`:
-  the codes of the header against the crate's; `Cargo.lock`.
-- `pg_pmu_core.h`: the C declarations of the crate's functions.
-- `pg_pmu.h`: what the two C files of the module share.
-- `pg_pmu.c`: the option, the hooks, the frames, the depth, the
-  records, the output, the errors of the counters.
-- `workers.c`: the request of the shared memory, the setting
-  `pg_pmu.cell`, the holds of cells, and the counting in the workers,
-  all through the crate.
-- `test/abi.c`: the C file of the module that includes
-  `pg_pmu_core.h`, compares its types with the crate's, and on Linux
-  compares `src/counters/perf_abi.rs` with `<linux/perf_event.h>`,
-  when the module loads.
-- `pg_pmu.conf`: the settings of the temporary server of the suite.
-- `sql/`, `expected/`: the regression suite.
-- `README.md`: loading, use, what the counts mean on each system.
-- `.github/workflows/ci.yml`: builds and tests;
-  `.github/postgres.env`: the revisions of PostgreSQL it builds;
-  `.github/scripts/build-postgres.sh`: the build of PostgreSQL.
 
 ## Tests
 
 The regression suite runs on a temporary server started with
 `pg_pmu.conf`: the module in `shared_preload_libraries`,
-`pg_pmu.max_nested` set to 2, so that two nested statements at once
-work and a third finds no cell; the default number of workers is
-enough for an outer and an inner parallel query at once. Counts change from run to run,
-so the suite compares them, not their values: positive numbers, more
-for a larger table, the part of the workers within the counts of the
-execution. A function of the suite runs each EXPLAIN, replaces the
+`pg_pmu.max_nested` set to 2, so that two nested statements at once work
+and a third finds no cell; the default number of workers is enough for
+an outer and an inner parallel query at once. Counts change from run to
+run, so the suite compares them, not their values: positive numbers,
+more for a larger table, the part of the workers within the counts of
+the execution. A function of the suite runs each EXPLAIN, replaces the
 numbers of the text format with `N`, and prints one line, "cannot
-count", when the statement fails with any of the three codes of a
-system that cannot count. Each suite that needs counters has a second
-expected output with that line; `sql/option.sql` needs none and has
-one output.
+count", when the statement fails with any of the three codes of a system
+that cannot count. Each suite that needs counters has a second expected
+output with that line; `sql/option.sql` needs none and has one output.
 
 The tests of the workers set `min_parallel_table_scan_size` and the
 costs of parallel plans to zero, and check in the same output that
@@ -842,3 +1035,129 @@ cannot print in a stable form; SQL run while the plan is printed,
 also with the same plan, which needs a type or a custom scan written
 in C; a parallel index build whose expression runs a query inside a
 counting statement.
+
+### Which test shows each case
+
+Each case of the suites carries a mark `-- case: <name>` beside its
+statements, and the expected outputs repeat it. A test of the crate is
+named by its file and its function. Where only some machines can run
+a case, the list says where.
+
+Loading the module:
+
+- Loaded at the start: `sql/counters.sql`
+- Loaded later: `sql/unloaded.sql`
+- Not loaded: `sql/unloaded.sql`
+
+The option PMU:
+
+- With ANALYZE: `sql/counters.sql`
+- Without ANALYZE: `sql/option.sql`
+- Turned off: `sql/option.sql`
+- auto_explain: `sql/option.sql`
+
+Counts of the execution:
+
+- More rows, more work: `sql/counters.sql`
+- Work of a function: `sql/counters.sql`
+
+Counts of the planning:
+
+- A query planned by EXPLAIN: `sql/counters.sql`
+- A prepared statement: `sql/counters.sql`
+
+The output:
+
+- Text: `sql/counters.sql`
+- JSON and YAML: `sql/counters.sql`
+- XML: `sql/counters.sql`
+- A rule makes two plans: `sql/counters.sql`
+- No plan: `sql/counters.sql`
+
+The part of the parallel workers:
+
+- The workers do the scan: `sql/counters.sql`
+- No workers: `sql/counters.sql`
+- A hidden Gather: `sql/counters.sql`
+- In a worker: `sql/counters.sql`
+
+Nested counting statements:
+
+- Inside a parallel plan: `sql/counters.sql`
+- A nested statement fails: `sql/counters.sql`
+- Two nested statements fail together: `sql/counters.sql`
+- No free place: `sql/counters.sql`
+- The setting of the module: `sql/option.sql`
+
+Counting on each system:
+
+- Linux, counting allowed: `sql/counters.sql`, checked by `make
+  installcheck-counted` on the Linux runners of CI that show a hardware
+  PMU
+- Linux, counting refused: `sql/paranoid.sql`, run by `make
+  installcheck-paranoid` on the Linux runners of CI that show a hardware
+  PMU
+- Apple silicon: `sql/counters.sql`, checked by `make
+  installcheck-counted` on a Mac with Apple silicon; the macOS runners
+  of CI are virtual machines
+- A virtual machine with macOS: `sql/vm.sql`, run by `make
+  installcheck-vm` on the macOS runners of CI
+
+When the system cannot count:
+
+- Nothing runs: `sql/counters.sql`
+- A caught failure of a worker: `sql/workers_cannot_count.sql`, run by
+  `make installcheck-workers-cannot-count` with the build
+  `PG_PMU_TEST=workers-cannot-count` on the Linux runners of CI that
+  show a hardware PMU
+
+The shared memory of the workers:
+
+- The size at the start: `sql/option.sql`
+- A report after the return: `crates/pg_pmu_core/tests/loom.rs`,
+  `a_late_report_against_a_new_taking`
+- A token that is not valid: `crates/pg_pmu_core/tests/ffi.rs`,
+  `workers_report_into_the_cell_of_their_token`
+- A return while a worker adds: `crates/pg_pmu_core/tests/loom.rs`,
+  `reports_against_a_close`
+
+## Files
+
+- `Makefile`: the PGXS build of the module and its suite, with the
+  crate built by Cargo and linked in; the variable
+  `PG_PMU_COUNTERS=none` builds the crate with the feature `none`, the
+  version that cannot count, and `PG_PMU_TEST=workers-cannot-count`
+  the module whose parallel workers cannot count, for its suite.
+- `crates/pg_pmu_core/`: the crate. `src/cells.rs`: the layout, the
+  token and the steps. `src/counters/mod.rs`: the references;
+  `perf.rs`: the groups of perf events over the calls of the system;
+  `linux.rs`: those calls on Linux; `perf_abi.rs`: the few
+  declarations of Linux's perf events; `macos.rs`, `none.rs`: the
+  other systems. `src/sysfs.rs`: the kinds of cores and their
+  coverage. `src/ffi.rs`: the functions C calls. The proofs of Kani
+  are beside the code they prove. `tests/model.rs`: the tests of
+  proptest against the plain models; `tests/loom.rs`: the models of
+  loom; `tests/counters.rs`: the tests on real counters; `tests/abi.rs`:
+  the codes of the header against the crate's; `tests/ffi.rs`: the
+  functions C calls for the cells; `Cargo.lock`.
+- `pg_pmu_core.h`: the C declarations of the crate's functions.
+- `pg_pmu.h`: what the two C files of the module share.
+- `pg_pmu.c`: the option, the hooks, the frames, the depth, the
+  records, the output, the errors of the counters.
+- `workers.c`: the request of the shared memory, the setting
+  `pg_pmu.cell`, the holds of cells, and the counting in the workers,
+  all through the crate.
+- `test/abi.c`: the C file of the module that includes
+  `pg_pmu_core.h`, compares its types with the crate's, and on Linux
+  compares `src/counters/perf_abi.rs` with `<linux/perf_event.h>`,
+  when the module loads.
+- `pg_pmu.conf`: the settings of the temporary server of the suite.
+- `sql/`, `expected/`: the regression suites.
+- `README.md`: loading, use, what the counts mean on each system, and
+  the observations of the counts; `doc/design.md`: this document.
+- `.github/workflows/ci.yml`: builds and tests;
+  `.github/workflows/observations.yml`: the observations of the README
+  on the runners of Linux; `.github/postgres.env`: the revisions of
+  PostgreSQL they build; `.github/scripts/`: the build of PostgreSQL,
+  the probe of the runner's PMU, the expected outputs each suite
+  matched, and the statements of the observations.
