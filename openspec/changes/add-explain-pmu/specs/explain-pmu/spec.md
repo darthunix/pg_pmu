@@ -372,8 +372,8 @@ not comparable.
 - **THEN** `EXPLAIN (ANALYZE, PMU)` shows the counts
 - **Verified by:**
   `sql/counters.sql::spec: explain-pmu/Linux, counting allowed`,
-  checked by `make installcheck-counted` on the AArch64 Linux runners
-  of CI, which count
+  checked by `make installcheck-counted` on the Linux runners of CI,
+  which count
 
 #### Scenario: Linux, counting refused
 
@@ -384,8 +384,7 @@ not comparable.
   filters of containers
 - **Verified by:**
   `sql/paranoid.sql::spec: explain-pmu/Linux, counting refused`,
-  run by `make installcheck-paranoid` on the AArch64 Linux runners of
-  CI
+  run by `make installcheck-paranoid` on the Linux runners of CI
 
 #### Scenario: Apple silicon
 
@@ -448,8 +447,7 @@ counts again.
 - **Verified by:**
   `sql/workers_cannot_count.sql::spec: explain-pmu/A caught failure of a worker`,
   run by `make installcheck-workers-cannot-count` with the build
-  `PG_PMU_TEST=workers-cannot-count` on the AArch64 Linux runners of
-  CI
+  `PG_PMU_TEST=workers-cannot-count` on the Linux runners of CI
 
 ### Requirement: The shared memory of the workers
 

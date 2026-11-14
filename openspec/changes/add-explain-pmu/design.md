@@ -813,11 +813,11 @@ hint. `sql/vm.sql` runs in a virtual machine with macOS: 0A000.
 `sql/workers_cannot_count.sql` runs on a machine that counts, with a
 build of the module whose parallel workers fail to open their
 counters: a function that catches the error of such a worker does not
-save the statement. Of the runners of CI those of AArch64 Linux count;
-the x86-64 ones count too, with a virtual PMU, which CI does not count
-on; and those of macOS are virtual machines that report no
-instructions. So CI demands counts on AArch64 Linux, runs the first
-and the third suite there and the second on macOS.
+save the statement. Of the runners of CI those of Linux count, on
+AArch64 and on x86-64, the latter with a virtual PMU, and those of
+macOS are virtual machines that report no instructions. So CI demands
+counts on Linux, runs the first and the third suite there and the
+second on macOS.
 
 The crate has its own checks, run in `crates/pg_pmu_core` by
 `cargo test`, by `cargo test` with `--cfg loom` for the models of

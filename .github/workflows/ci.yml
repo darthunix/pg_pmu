@@ -1,13 +1,13 @@
 # Builds and tests of pg_pmu: the suites on PostgreSQL 19 and master,
 # at the revisions of postgres.env, on Linux on x86-64 and on AArch64
 # and on macOS on Apple silicon; the checks of the crate; its models of
-# loom; its proofs of Kani. The runners of AArch64 Linux count: there
-# the suites must match their first expected outputs, and the suites of
-# a kernel that refuses and of workers that cannot count run too. The
-# x86-64 runners counted in the first run as well, with a virtual PMU,
-# but the job does not demand it there; the macOS runners are virtual
-# machines that report no instructions and match the second expected
-# outputs. The step "Expected outputs" says which output matched.
+# loom; its proofs of Kani. The runners of Linux count, on AArch64 and
+# on x86-64, the latter with a virtual PMU: there the suites must match
+# their first expected outputs, and the suites of a kernel that refuses
+# and of workers that cannot count run too, so that a runner that stops
+# counting fails the job. The macOS runners are virtual machines that
+# report no instructions and match the second expected outputs. The
+# step "Expected outputs" says which output matched.
 name: CI
 
 on:
@@ -29,7 +29,7 @@ jobs:
     env:
       # The locale of the temporary servers of the suites.
       LANG: C.UTF-8
-      COUNTS: ${{ matrix.os == 'ubuntu-24.04-arm' }}
+      COUNTS: ${{ startsWith(matrix.os, 'ubuntu') }}
     steps:
       - uses: actions/checkout@v4
       - name: Revision
