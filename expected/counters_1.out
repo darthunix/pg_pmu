@@ -473,7 +473,8 @@ SELECT explain_in_worker(:leader);
 
 RESET debug_parallel_query;
 -- A counting EXPLAIN of a parallel count(*) run by a function above the
--- Gather of the outer statement; it says its facts in a notice.
+-- Gather of the outer statement, at its Finalize Aggregate, after the
+-- outer workers have ended; it says its facts in a notice.
 CREATE FUNCTION inner_explain() RETURNS int
 LANGUAGE plpgsql PARALLEL RESTRICTED AS $$
 DECLARE
@@ -503,23 +504,74 @@ FROM q, o;
                 |                       | 
 (1 row)
 
--- A plain parallel query whose function, run by the backend while the
--- workers still scan, runs a counting EXPLAIN: the workers of the plain
--- query count for nobody.
+-- A plain parallel query whose function, run by the backend at one of
+-- the first rows, while the workers of the plain query, which carry no
+-- cell, still scan, runs a counting EXPLAIN with workers of its own.
 CREATE FUNCTION explain_at(n int) RETURNS int
 LANGUAGE plpgsql PARALLEL RESTRICTED AS $$
 BEGIN
-  IF n = 500 THEN
+  IF n = 7 THEN
     PERFORM inner_explain();
   END IF;
   RETURN n;
 END
 $$;
-SELECT count(explain_at(g)) FROM small;
+SELECT count(explain_at(g)) FROM big;
 NOTICE:  inner: launched <NULL>, workers counted <NULL>, within <NULL>
- count 
--------
-  1000
+ count  
+--------
+ 100000
+(1 row)
+
+-- Without VERBOSE, no part of the workers.
+SELECT * FROM pmu_explain($$
+  EXPLAIN (ANALYZE, PMU, COSTS off, TIMING off, SUMMARY off, BUFFERS off)
+  SELECT count(*) FROM big$$) AS line WHERE line ~ 'PMU:';
+ line 
+------
+(0 rows)
+
+-- A nested statement that succeeds hands its cell down at its end: the
+-- part of the workers of a serial outer statement is exactly that of
+-- the nested one, neither lost nor counted twice.
+CREATE TEMP TABLE nested_part (instructions numeric);
+CREATE FUNCTION nested_count() RETURNS int
+LANGUAGE plpgsql AS $$
+BEGIN
+  INSERT INTO nested_part
+    SELECT (j ->> 'Workers Instructions')::numeric
+    FROM pmu_json('EXPLAIN (ANALYZE, PMU, VERBOSE, FORMAT JSON)
+                   SELECT count(*) FROM big') AS j;
+  RETURN 1;
+END
+$$;
+CREATE TEMP TABLE outer_doc AS
+  SELECT pmu_json($$EXPLAIN (ANALYZE, PMU, VERBOSE, FORMAT JSON)
+                    SELECT nested_count()$$) AS j;
+SELECT (o.j ->> 'Workers Instructions')::numeric = n.instructions
+       AS the_nested_part_once
+FROM outer_doc AS o, nested_part AS n;
+ the_nested_part_once 
+----------------------
+(0 rows)
+
+-- The parameters of EXPLAIN EXECUTE run before the statement, and
+-- their workers report to the cell of the same frame: the statement,
+-- serial, has no part of the workers.
+CREATE FUNCTION scan_big() RETURNS int
+LANGUAGE plpgsql AS $$
+BEGIN
+  PERFORM count(*) FROM big;
+  RETURN 1;
+END
+$$;
+PREPARE serial(int) AS SELECT $1;
+SELECT pmu_json($$EXPLAIN (ANALYZE, PMU, VERBOSE, FORMAT JSON)
+                  EXECUTE serial(scan_big())$$) ? 'Workers Instructions'
+       AS has_part_of_workers;
+ has_part_of_workers 
+---------------------
+ 
 (1 row)
 
 -- Workers that run a function with a query count it too.
