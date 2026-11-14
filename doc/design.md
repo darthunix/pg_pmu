@@ -15,8 +15,8 @@ EXPLAIN (ANALYZE, PMU, VERBOSE) SELECT count(*) FROM t;
 The main use is to compare two ways of running the same query: two
 plans, two settings, two executors. Once the caches are warm,
 instructions repeat almost exactly from run to run, while time and
-cycles vary much more (see [observations.md](observations.md)). The
-goals and limitations are in the [README](../README.md).
+cycles vary much more. The goals and limitations are in the
+[README](../README.md).
 
 This note explains how the module counts one process, how it finds
 the statement, and how parallel workers report their part.

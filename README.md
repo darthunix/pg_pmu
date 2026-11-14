@@ -13,9 +13,8 @@ EXPLAIN (ANALYZE, PMU, TIMING off) SELECT count(*) FROM t;
 
 Time changes from run to run; the number of instructions barely does.
 That makes pg_pmu a tool for comparing two ways to run the same query:
-two plans, two settings, two executors. See
-[doc/observations.md](doc/observations.md) for how stable the counts
-are, and [doc/design.md](doc/design.md) for how the module works.
+two plans, two settings, two executors. How the module works is in
+[doc/design.md](doc/design.md).
 
 ## Goals
 
