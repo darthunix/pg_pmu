@@ -733,7 +733,8 @@ system calls for that are few, and `libc` has the call itself.
 - `Makefile`: the PGXS build of the module and its suite, with the
   crate built by Cargo and linked in; the variable
   `PG_PMU_COUNTERS=none` builds the crate with the feature `none`, the
-  version that cannot count.
+  version that cannot count, and `PG_PMU_TEST=workers-cannot-count`
+  the module whose parallel workers cannot count, for its suite.
 - `crates/pg_pmu_core/`: the crate. `src/cells.rs`: the layout, the
   token and the steps. `src/counters/mod.rs`: the references;
   `perf.rs`: the groups of perf events over the calls of the system;
@@ -768,8 +769,8 @@ system calls for that are few, and `libc` has the call itself.
 The regression suite runs on a temporary server started with
 `pg_pmu.conf`: the module in `shared_preload_libraries`,
 `pg_pmu.max_nested` set to 2, so that two nested statements at once
-work and a third finds no cell, and enough workers for an outer and an
-inner parallel query at once. Counts change from run to run,
+work and a third finds no cell; the default number of workers is
+enough for an outer and an inner parallel query at once. Counts change from run to run,
 so the suite compares them, not their values: positive numbers, more
 for a larger table, the part of the workers within the counts of the
 execution. A function of the suite runs each EXPLAIN, replaces the

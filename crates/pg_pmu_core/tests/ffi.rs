@@ -177,10 +177,19 @@ fn workers_report_into_the_cell_of_their_token() {
     assert_eq!(read(base, token), Err(Status::StaleToken as i32));
     assert_eq!(unsafe { pmu_cell_take_pool(base, &mut token) }, OK);
     assert_eq!(read(base, token), Ok(Contents::default()));
-    assert_eq!(
-        unsafe { pmu_cell_report(base, (1 << 20) | 9, 5, 5) },
-        Status::BadToken as i32
-    );
+    // Tokens that are not valid: no cell, a cell beyond the memory, an
+    // even generation; nothing is added anywhere.
+    for bad in [0, (1 << 20) | 9, (2 << 20) | 1] {
+        assert_eq!(
+            unsafe { pmu_cell_report(base, bad, 5, 5) },
+            Status::BadToken as i32
+        );
+        assert_eq!(
+            unsafe { pmu_cell_report_failure(base, bad, 53) },
+            Status::BadToken as i32
+        );
+    }
+    assert_eq!(read(base, token), Ok(Contents::default()));
 }
 
 #[test]

@@ -546,7 +546,7 @@ SQLSTATE XX000 before it runs, until the restart.
   number below 2^64
 - **THEN** the report is refused and no cell changes
 - **Verified by:**
-  `crates/pg_pmu_core/tests/ffi.rs::tokens_are_read_from_the_setting`
+  `crates/pg_pmu_core/tests/ffi.rs::workers_report_into_the_cell_of_their_token`
 
 #### Scenario: A return while a worker adds
 
