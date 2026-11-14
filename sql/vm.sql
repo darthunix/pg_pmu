@@ -1,6 +1,5 @@
 -- On a virtual machine with macOS, whose kernel reports no instructions
 -- for the process, as the macOS runners of CI: a counting EXPLAIN fails
 -- before the statement runs.
--- case: A virtual machine with macOS
 \set VERBOSITY sqlstate
 EXPLAIN (ANALYZE, PMU) SELECT 1;

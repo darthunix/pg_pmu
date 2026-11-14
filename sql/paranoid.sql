@@ -2,5 +2,4 @@
 -- kernel refuses the events to every process without privileges, as CI
 -- sets it on its Ubuntu runners: the error, the error of the system,
 -- and the hint.
--- case: Linux, counting refused
 EXPLAIN (ANALYZE, PMU) SELECT 1;

@@ -1,12 +1,10 @@
 -- The option PMU, on a server that preloads pg_pmu. Nothing here
 -- needs counters.
 
--- case: Loaded at the start
 -- On a server that preloads the module, LOAD finds it loaded and does
 -- nothing.
 LOAD 'pg_pmu';
 
--- case: Without ANALYZE
 \set VERBOSITY sqlstate
 EXPLAIN (PMU) SELECT 1;
 EXPLAIN (PMU true, ANALYZE false) SELECT 1;
@@ -18,7 +16,6 @@ EXPLAIN (PMU) SELECT 1;
 EXPLAIN (PMU maybe) SELECT 1;
 \set VERBOSITY default
 
--- case: Turned off
 EXPLAIN (ANALYZE, PMU off, COSTS off, TIMING off, SUMMARY off,
          BUFFERS off) SELECT 1;
 EXPLAIN (ANALYZE, PMU 0, COSTS off, TIMING off, SUMMARY off,
@@ -27,7 +24,6 @@ EXPLAIN (ANALYZE, COSTS off, TIMING off, SUMMARY off, BUFFERS off)
   SELECT 1;
 EXPLAIN (PMU false) SELECT 1;
 
--- case: auto_explain
 LOAD 'auto_explain';
 \set VERBOSITY sqlstate
 SET auto_explain.log_extension_options = 'pmu';
@@ -35,16 +31,14 @@ SET auto_explain.log_extension_options = 'pmu on';
 \set VERBOSITY default
 SET auto_explain.log_extension_options = 'pmu';
 
--- case: The size at the start
 SELECT size = 16 + 32 * (current_setting('max_connections')::int
                          + current_setting('autovacuum_worker_slots')::int
                          + current_setting('max_worker_processes')::int
                          + current_setting('max_wal_senders')::int + 2
                          + current_setting('pg_pmu.max_nested')::int)
-       AS size_as_the_spec_says
+       AS size_as_documented
 FROM pg_shmem_allocations WHERE name = 'pg_pmu';
 
--- case: The setting of the module
 \set VERBOSITY sqlstate
 SET pg_pmu.cell = 1;
 BEGIN;
