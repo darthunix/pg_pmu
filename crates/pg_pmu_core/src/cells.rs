@@ -33,6 +33,9 @@ pub const EMPTYING: u64 = LOW_MASK;
 /// The generation counts modulo 2^44.
 pub const G_MASK: u64 = (1 << (64 - LOW_BITS)) - 1;
 
+// The layout of the spec: G in bits 20 to 63, W in bits 0 to 19.
+const _: () = assert!(LOW_BITS == 20 && EMPTYING == 0xF_FFFF && G_MASK == 0xFFF_FFFF_FFFF);
+
 /// The header of the memory, written once when the server starts.
 #[repr(C)]
 #[derive(Debug)]
@@ -306,14 +309,21 @@ pub fn take_from_pool(pool: &[Cell]) -> Option<(usize, u64)> {
 mod proofs {
     use super::*;
 
-    /// The three states the spec allows.
+    /// The three states the spec allows, written with the numbers of the
+    /// spec rather than the code's constants: G in bits 20 to 63, W in
+    /// bits 0 to 19, the mark of emptying all ones.
     fn allowed(s: u64) -> bool {
-        let w = writers(s);
-        if generation(s) & 1 == 1 {
-            w < EMPTYING
+        let w = s & 0xF_FFFF;
+        if (s >> 20) & 1 == 1 {
+            w < 0xF_FFFF
         } else {
-            w == 0 || w == EMPTYING
+            w == 0 || w == 0xF_FFFF
         }
+    }
+
+    /// The state of generation `g` modulo 2^44 and writers `w`.
+    fn spec_state(g: u64, w: u64) -> u64 {
+        ((g % (1 << 44)) << 20) | w
     }
 
     /// Every token, for every number of cells up to 2^20 - 1, is valid
@@ -367,45 +377,85 @@ mod proofs {
         }
     }
 
-    /// Each step, from every state the spec allows and with every
-    /// generation, does what the spec says and leads to an allowed
-    /// state, or refuses and leaves the state as it was.
+    /// Each step, from every state the spec allows, with every
+    /// generation and every sums, is taken exactly when the spec allows
+    /// it, makes the state the spec says and leads to an allowed one,
+    /// returns what the cell holds where it returns anything, and leaves
+    /// the sums as they were, but for emptying, which takes them and
+    /// leaves zeros; a refused step changes nothing.
     #[kani::proof]
     #[kani::unwind(3)]
     fn steps_keep_the_states_of_the_spec() {
         let s: u64 = kani::any();
         kani::assume(allowed(s));
         let g: u64 = kani::any();
-        let (sg, sw) = (generation(s), writers(s));
+        let sums = Contents {
+            instructions: kani::any(),
+            cycles: kani::any(),
+            failures: kani::any(),
+            sqlstate: kani::any(),
+        };
+        let (sg, sw) = (s >> 20, s & 0xF_FFFF);
         let taken = sg & 1 == 1;
+        let mine = taken && sg == g;
         let cell = Cell::default();
         cell.state.store(s, SeqCst);
+        cell.instructions.store(sums.instructions, SeqCst);
+        cell.cycles.store(sums.cycles, SeqCst);
+        cell.failures.store(sums.failures, SeqCst);
+        cell.sqlstate.store(sums.sqlstate, SeqCst);
 
-        let (ok, want_ok, want) = match kani::any::<u8>() % 7 {
-            0 => (
-                cell.take().is_some(),
-                !taken && sw == 0,
-                state_of(sg.wrapping_add(1), 0),
-            ),
+        let mut emptied = false;
+        let (ok, want_ok, want) = match kani::any::<u8>() % 8 {
+            0 => {
+                let got = cell.take();
+                if let Some(new) = got {
+                    assert_eq!(new, (sg + 1) % (1 << 44));
+                }
+                (got.is_some(), !taken && sw == 0, spec_state(sg + 1, 0))
+            }
             1 => (
                 cell.enter(g).is_ok(),
-                taken && sg == g && sw + 1 < EMPTYING,
-                s + 1,
+                mine && sw + 1 < 0xF_FFFF,
+                s.wrapping_add(1),
             ),
             2 => (cell.leave().is_ok(), taken && sw > 0, s.wrapping_sub(1)),
-            3 => (cell.read(g).is_ok(), taken && sg == g && sw == 0, s),
+            3 => {
+                let got = cell.read(g);
+                if let Ok(c) = got {
+                    assert_eq!(c, sums);
+                }
+                (got.is_ok(), mine && sw == 0, s)
+            }
             4 => (
                 cell.close(g).is_ok(),
-                taken && sg == g && sw == 0,
-                state_of(sg.wrapping_add(1), EMPTYING),
+                mine && sw == 0,
+                spec_state(sg + 1, 0xF_FFFF),
             ),
-            5 => (cell.empty().is_ok(), sw == EMPTYING, s),
-            _ => (cell.open().is_ok(), sw == EMPTYING, state_of(sg, 0)),
+            5 => {
+                let got = cell.empty();
+                if let Ok(c) = got {
+                    assert_eq!(c, sums);
+                    emptied = true;
+                }
+                (got.is_ok(), sw == 0xF_FFFF, s)
+            }
+            6 => (cell.open().is_ok(), sw == 0xF_FFFF, spec_state(sg, 0)),
+            _ => {
+                let got = cell.give_back(g);
+                if let Ok(c) = got {
+                    assert_eq!(c, sums);
+                    emptied = true;
+                }
+                (got.is_ok(), mine && sw == 0, spec_state(sg + 1, 0))
+            }
         };
         let now = cell.state.load(SeqCst);
         assert_eq!(ok, want_ok);
         assert_eq!(now, if ok { want } else { s });
         assert!(allowed(now));
+        let left = if emptied { Contents::default() } else { sums };
+        assert_eq!(cell.contents(), left);
     }
 }
 
