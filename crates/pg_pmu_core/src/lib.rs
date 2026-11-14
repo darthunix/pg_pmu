@@ -15,6 +15,7 @@
 #[cfg(not(target_has_atomic = "64"))]
 compile_error!("pg_pmu needs a processor with native 64-bit atomics");
 
+pub mod cells;
 pub mod counters;
 pub mod ffi;
 mod status;

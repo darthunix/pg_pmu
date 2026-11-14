@@ -659,3 +659,247 @@ fn groups_are_added() {
     assert_eq!(c.instructions, 1101 + 1103);
     assert_eq!(c.cycles, 2101 + 2103);
 }
+
+// ---------------------------------------------------------------------
+// The cells
+// ---------------------------------------------------------------------
+
+use pg_pmu_core::cells::{self, Cell, Contents, EMPTYING, G_MASK, LOW_MASK};
+
+/// Which generation an operation uses: the last one taken, one taken
+/// before, or any number.
+#[derive(Clone, Debug)]
+enum Gen {
+    Last,
+    Old(usize),
+    Any(u64),
+}
+
+#[derive(Clone, Debug)]
+enum CellOp {
+    Take,
+    Enter(Gen),
+    Add(u32, u32),
+    Fail(u32),
+    Leave,
+    Read(Gen),
+    Close(Gen),
+    Empty,
+    Open,
+    GiveBack(Gen),
+}
+
+fn gen_sel() -> impl Strategy<Value = Gen> {
+    prop_oneof![
+        3 => Just(Gen::Last),
+        1 => any::<usize>().prop_map(Gen::Old),
+        1 => (0..=G_MASK).prop_map(Gen::Any),
+    ]
+}
+
+fn cell_op() -> impl Strategy<Value = CellOp> {
+    prop_oneof![
+        Just(CellOp::Take),
+        gen_sel().prop_map(CellOp::Enter),
+        (any::<u32>(), any::<u32>()).prop_map(|(i, c)| CellOp::Add(i, c)),
+        any::<u32>().prop_map(CellOp::Fail),
+        Just(CellOp::Leave),
+        gen_sel().prop_map(CellOp::Read),
+        gen_sel().prop_map(CellOp::Close),
+        Just(CellOp::Empty),
+        Just(CellOp::Open),
+        gen_sel().prop_map(CellOp::GiveBack),
+    ]
+}
+
+/// The first state of a cell: free at an even generation, or taken at
+/// an odd one with some writers, near 0, near the wrap of the
+/// generation or anywhere, and near the bound of the writers.
+fn first_state() -> impl Strategy<Value = (u64, u64)> {
+    let g = prop_oneof![0..8u64, (G_MASK - 8)..=G_MASK, 0..=G_MASK];
+    let w = prop_oneof![Just(0u64), 1..4u64, (EMPTYING - 3)..EMPTYING];
+    (g, w).prop_map(|(g, w)| if g % 2 == 0 { (g, 0) } else { (g, w) })
+}
+
+/// A cell, written plainly.
+struct PlainCell {
+    g: u64,
+    w: u64,
+    emptying: bool,
+    sums: Contents,
+}
+
+impl PlainCell {
+    fn taken(&self) -> bool {
+        self.g % 2 == 1
+    }
+
+    fn take(&mut self) -> Option<u64> {
+        if self.taken() || self.emptying {
+            return None;
+        }
+        self.g = (self.g + 1) % (G_MASK + 1);
+        Some(self.g)
+    }
+
+    fn enter(&mut self, g: u64) -> Result<(), Status> {
+        if !self.taken() || self.g != g {
+            return Err(Status::StaleToken);
+        }
+        if self.w + 1 >= EMPTYING {
+            return Err(Status::Internal);
+        }
+        self.w += 1;
+        Ok(())
+    }
+
+    fn leave(&mut self) -> Result<(), Status> {
+        if !self.taken() || self.w == 0 {
+            return Err(Status::Internal);
+        }
+        self.w -= 1;
+        Ok(())
+    }
+
+    fn read(&self, g: u64) -> Result<Contents, Status> {
+        if !self.taken() || self.g != g {
+            return Err(Status::StaleToken);
+        }
+        if self.w != 0 {
+            return Err(Status::CellBusy);
+        }
+        Ok(self.sums)
+    }
+
+    fn close(&mut self, g: u64) -> Result<(), Status> {
+        self.read(g)?;
+        self.g = (self.g + 1) % (G_MASK + 1);
+        self.emptying = true;
+        Ok(())
+    }
+
+    fn empty(&mut self) -> Result<Contents, Status> {
+        if !self.emptying {
+            return Err(Status::Internal);
+        }
+        Ok(std::mem::take(&mut self.sums))
+    }
+
+    fn open(&mut self) -> Result<(), Status> {
+        if !self.emptying {
+            return Err(Status::Internal);
+        }
+        self.emptying = false;
+        Ok(())
+    }
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(2048))]
+
+    #[test]
+    fn a_cell_follows_the_model(first in first_state(),
+                                ops in prop::collection::vec(cell_op(), 0..48)) {
+        let cell = Cell::default();
+        cell.state.store((first.0 << 20) | first.1, std::sync::atomic::Ordering::SeqCst);
+        let mut m = PlainCell { g: first.0, w: first.1, emptying: false,
+                                sums: Contents::default() };
+        let mut taken = vec![first.0];
+        for op in ops {
+            let pick = |sel: &Gen| match *sel {
+                Gen::Last => taken.last().copied().unwrap_or(0),
+                Gen::Old(i) => taken[i % taken.len()],
+                Gen::Any(g) => g,
+            };
+            match op {
+                CellOp::Take => {
+                    let got = cell.take();
+                    prop_assert_eq!(got, m.take());
+                    taken.extend(got);
+                }
+                CellOp::Enter(sel) => {
+                    let g = pick(&sel);
+                    prop_assert_eq!(cell.enter(g), m.enter(g));
+                }
+                // A worker adds only after it entered.
+                CellOp::Add(i, c) if m.taken() && m.w > 0 => {
+                    cell.add(u64::from(i), u64::from(c));
+                    m.sums.instructions = m.sums.instructions.wrapping_add(u64::from(i));
+                    m.sums.cycles = m.sums.cycles.wrapping_add(u64::from(c));
+                }
+                CellOp::Fail(code) if m.taken() && m.w > 0 => {
+                    cell.fail(code);
+                    m.sums.failures += 1;
+                    m.sums.sqlstate = code;
+                }
+                CellOp::Add(..) | CellOp::Fail(_) => {}
+                CellOp::Leave => prop_assert_eq!(cell.leave(), m.leave()),
+                CellOp::Read(sel) => {
+                    let g = pick(&sel);
+                    prop_assert_eq!(cell.read(g), m.read(g));
+                }
+                CellOp::Close(sel) => {
+                    let g = pick(&sel);
+                    prop_assert_eq!(cell.close(g), m.close(g));
+                }
+                CellOp::Empty => prop_assert_eq!(cell.empty(), m.empty()),
+                CellOp::Open => prop_assert_eq!(cell.open(), m.open()),
+                CellOp::GiveBack(sel) => {
+                    let g = pick(&sel);
+                    let want = m.close(g).and_then(|()| m.empty())
+                        .and_then(|sums| m.open().map(|()| sums));
+                    prop_assert_eq!(cell.give_back(g), want);
+                }
+            }
+            let (g, w) = cell.state();
+            let want_w = if m.emptying { EMPTYING } else { m.w };
+            prop_assert_eq!((g, w), (m.g, want_w));
+        }
+    }
+
+    #[test]
+    fn tokens_are_valid_exactly_as_the_rule_says(token in prop_oneof![
+            any::<u64>(),
+            (0u32..300, 0..=G_MASK).prop_map(|(i, g)| cells::token(i, g)),
+            (0..=G_MASK).prop_map(|g| g << 20),
+            (0..=G_MASK).prop_map(|g| (g << 20) | LOW_MASK),
+        ],
+        count in prop_oneof![Just(0u32), 1u32..300, Just(LOW_MASK as u32)]) {
+        let number = token & LOW_MASK;
+        let g = token >> 20;
+        let valid = number >= 1 && number <= u64::from(count) && g % 2 == 1;
+        let got = cells::split(token, count);
+        prop_assert_eq!(got.is_some(), valid);
+        if let Some((index, g)) = got {
+            prop_assert_eq!(cells::token(index as u32, g), token);
+        }
+    }
+
+    #[test]
+    fn tokens_read_back_from_decimal(token in any::<u64>()) {
+        prop_assert_eq!(cells::parse_token(token.to_string().as_bytes()), Ok(token));
+    }
+
+    #[test]
+    fn decimal_forms_are_refused_as_the_rule_says(text in "[0-9+ a-]{0,24}") {
+        let want = if !text.is_empty() && text.bytes().all(|b| b.is_ascii_digit()) {
+            text.parse::<u64>().map_err(|_| Malformed)
+        } else {
+            Err(Malformed)
+        };
+        prop_assert_eq!(cells::parse_token(text.as_bytes()), want);
+    }
+}
+
+#[test]
+fn a_cell_of_the_pool_is_taken_once() {
+    let pool = [Cell::default(), Cell::default(), Cell::default()];
+    let (a, ga) = cells::take_from_pool(&pool).unwrap();
+    let (b, _) = cells::take_from_pool(&pool).unwrap();
+    assert_ne!(a, b);
+    pool[a].give_back(ga).unwrap();
+    assert_eq!(cells::take_from_pool(&pool).map(|(i, _)| i), Some(a));
+    let (c, _) = cells::take_from_pool(&pool).unwrap();
+    assert!(c != a && c != b);
+    assert_eq!(cells::take_from_pool(&pool), None);
+}

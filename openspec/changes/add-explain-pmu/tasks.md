@@ -89,7 +89,7 @@ with the lints of the design, and the commands each task names.
 
 ## 4. The cells in Rust
 
-- [ ] 4.1 Add `src/cells.rs` to the crate: the header and the cells
+- [x] 4.1 Add `src/cells.rs` to the crate: the header and the cells
   as `#[repr(C)]` types with tests of their sizes and offsets against
   the spec, the 64-bit token with its decimal form and its checks of
   validity, the steps (take, enter, add, leave, close, empty, open,

@@ -34,6 +34,15 @@ pub enum Status {
     /// 0A000: the processor has more kinds of cores than the crate
     /// counts on.
     TooManyKinds = 11,
+    /// XX000: a report or a read with a token whose generation is not
+    /// that of its cell: the cell was given back.
+    StaleToken = 12,
+    /// XX000: a cell given back or read while a worker adds to it.
+    CellBusy = 13,
+    /// 53000: no cell of the pool is free for a nested statement.
+    NoCell = 14,
+    /// XX000: a token that is not a token of a cell.
+    BadToken = 15,
 }
 
 /// A code with the error of the system, `errno`, where there is one,
