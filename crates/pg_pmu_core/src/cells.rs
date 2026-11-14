@@ -302,6 +302,113 @@ pub fn take_from_pool(pool: &[Cell]) -> Option<(usize, u64)> {
         .find_map(|(i, cell)| cell.take().map(|g| (i, g)))
 }
 
+#[cfg(kani)]
+mod proofs {
+    use super::*;
+
+    /// The three states the spec allows.
+    fn allowed(s: u64) -> bool {
+        let w = writers(s);
+        if generation(s) & 1 == 1 {
+            w < EMPTYING
+        } else {
+            w == 0 || w == EMPTYING
+        }
+    }
+
+    /// Every token, for every number of cells up to 2^20 - 1, is valid
+    /// exactly as the spec says, and is made back from what it holds;
+    /// every cell and odd generation make a token that reads back.
+    #[kani::proof]
+    fn tokens_are_read_back() {
+        let t: u64 = kani::any();
+        let cells: u32 = kani::any();
+        kani::assume(u64::from(cells) <= LOW_MASK);
+        let number = t & LOW_MASK;
+        let valid = number >= 1 && number <= u64::from(cells) && (t >> LOW_BITS) & 1 == 1;
+        match split(t, cells) {
+            Some((index, g)) => {
+                assert!(valid);
+                assert_eq!(token(index as u32, g), t);
+            }
+            None => assert!(!valid),
+        }
+
+        let index: u32 = kani::any();
+        let g: u64 = kani::any();
+        kani::assume(index < cells && g <= G_MASK && g & 1 == 1);
+        assert_eq!(split(token(index, g), cells), Some((index as usize, g)));
+    }
+
+    /// Every string of up to 20 bytes is read as the number it writes in
+    /// decimal, or refused when it is not digits or not below 2^64.
+    #[kani::proof]
+    #[kani::unwind(21)]
+    fn decimal_forms_are_read_back() {
+        let buf: [u8; 20] = kani::any();
+        let len: usize = kani::any();
+        kani::assume(len <= buf.len());
+        let text = &buf[..len];
+        let mut digits = len > 0;
+        let mut value: u128 = 0;
+        for b in text {
+            if b.is_ascii_digit() {
+                value = value * 10 + u128::from(b - b'0');
+            } else {
+                digits = false;
+            }
+        }
+        match parse_token(text) {
+            Ok(n) => {
+                assert!(digits);
+                assert_eq!(u128::from(n), value);
+            }
+            Err(_) => assert!(!digits || value > u128::from(u64::MAX)),
+        }
+    }
+
+    /// Each step, from every state the spec allows and with every
+    /// generation, does what the spec says and leads to an allowed
+    /// state, or refuses and leaves the state as it was.
+    #[kani::proof]
+    #[kani::unwind(3)]
+    fn steps_keep_the_states_of_the_spec() {
+        let s: u64 = kani::any();
+        kani::assume(allowed(s));
+        let g: u64 = kani::any();
+        let (sg, sw) = (generation(s), writers(s));
+        let taken = sg & 1 == 1;
+        let cell = Cell::default();
+        cell.state.store(s, SeqCst);
+
+        let (ok, want_ok, want) = match kani::any::<u8>() % 7 {
+            0 => (
+                cell.take().is_some(),
+                !taken && sw == 0,
+                state_of(sg.wrapping_add(1), 0),
+            ),
+            1 => (
+                cell.enter(g).is_ok(),
+                taken && sg == g && sw + 1 < EMPTYING,
+                s + 1,
+            ),
+            2 => (cell.leave().is_ok(), taken && sw > 0, s.wrapping_sub(1)),
+            3 => (cell.read(g).is_ok(), taken && sg == g && sw == 0, s),
+            4 => (
+                cell.close(g).is_ok(),
+                taken && sg == g && sw == 0,
+                state_of(sg.wrapping_add(1), EMPTYING),
+            ),
+            5 => (cell.empty().is_ok(), sw == EMPTYING, s),
+            _ => (cell.open().is_ok(), sw == EMPTYING, state_of(sg, 0)),
+        };
+        let now = cell.state.load(SeqCst);
+        assert_eq!(ok, want_ok);
+        assert_eq!(now, if ok { want } else { s });
+        assert!(allowed(now));
+    }
+}
+
 #[cfg(all(test, not(loom)))]
 mod tests {
     #![allow(clippy::unwrap_used)]

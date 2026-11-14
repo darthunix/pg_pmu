@@ -106,7 +106,7 @@ with the lints of the design, and the commands each task names.
   while a report comes. Verify with
   `RUSTFLAGS="--cfg loom" cargo test --release --test loom` in
   `crates/pg_pmu_core`.
-- [ ] 4.3 Add the proofs of Kani for the cells, within the domains of
+- [x] 4.3 Add the proofs of Kani for the cells, within the domains of
   the design: the token and its decimal form made and read back, only
   valid tokens accepted, every step from an allowed state to an
   allowed one or a refusal, no panic. Verify with `cargo kani` in
