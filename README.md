@@ -55,12 +55,52 @@ that has the setting.
 ## Use
 
 ```sql
-EXPLAIN (ANALYZE, PMU) SELECT count(*) FROM t;
+EXPLAIN (ANALYZE, PMU, COSTS off, TIMING off, BUFFERS off)
+  SELECT count(*) FROM t;
 ```
+
+```
+ Aggregate (actual rows=1.00 loops=1)
+   ->  Seq Scan on t (actual rows=100000.00 loops=1)
+ Planning Time: 0.175 ms
+ Execution PMU: instructions=117361857 cycles=15273091
+ Execution Time: 4.198 ms
+```
+
+In JSON and YAML the counts are the properties "Execution
+Instructions" and "Execution Cycles" of the query, in XML the elements
+`Execution-Instructions` and `Execution-Cycles`. They come after the
+plan, the triggers, JIT and serialization, and before "Execution
+Time", also with `SUMMARY off`. Each plan of an EXPLAIN has its own,
+as with a rule that makes two.
 
 `PMU` takes the same values as PostgreSQL's own boolean options, and
 needs `ANALYZE`: without it EXPLAIN fails with SQLSTATE 22023.
 auto_explain cannot use it, as it explains a plan after it has run.
+
+### What the counts include
+
+Instructions are those the processor completed, cycles the clock
+cycles of the cores while they ran them. The execution counts cover
+the start of the executor, its run and the AFTER triggers, with every
+function and query the statement runs inside. They leave out the end
+of the executor, where it frees its resources, which comes after the
+counts are printed.
+
+They include the work EXPLAIN ANALYZE does to measure each node of
+the plan, a few dozen instructions for each row of each node; it
+weighs more on an executor that passes rows one by one than on one
+that passes them in batches. `TIMING off` makes it smaller.
+
+On Linux the counts are of the user space of the backend's thread; on
+macOS of the whole process, kernel included. Counts of the two
+systems are not comparable.
+
+When the system cannot count, a counting EXPLAIN fails before the
+statement runs: with SQLSTATE 42501 when the system does not allow
+it, 0A000 when it has no counters for the process, as in a virtual
+machine, and 53000 when no hardware counter or file descriptor is
+free.
 
 ## Testing
 

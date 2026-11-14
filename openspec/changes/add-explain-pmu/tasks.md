@@ -67,7 +67,7 @@ with the lints of the design, and the commands each task names.
 
 ## 3. Counting the statement
 
-- [ ] 3.1 Count the execution in the backend: the frames in the hook
+- [x] 3.1 Count the execution in the backend: the frames in the hook
   of utility statements, the depth, the records of the candidates and
   their removal in the hook of the end of the executor, the reads at
   the start and the finish of the executor, the choice of the record
