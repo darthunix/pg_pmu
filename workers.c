@@ -236,9 +236,17 @@ pmu_take_cell(int *guc_level)
 	snprintf(value, sizeof(value), UINT64_FORMAT, hold->token);
 	*guc_level = NewGUCNestLevel();
 	pmu_setting_cell = true;
-	(void) set_config_option("pg_pmu.cell", value, PGC_BACKEND, PGC_S_SESSION,
-							 GUC_ACTION_SAVE, true, 0, false);
-	pmu_setting_cell = false;
+	PG_TRY();
+	{
+		(void) set_config_option("pg_pmu.cell", value, PGC_BACKEND,
+								 PGC_S_SESSION, GUC_ACTION_SAVE, true, 0,
+								 false);
+	}
+	PG_FINALLY();
+	{
+		pmu_setting_cell = false;
+	}
+	PG_END_TRY();
 	return hold;
 }
 
@@ -461,18 +469,24 @@ pmu_worker_exit(int code, Datum arg)
 
 /*
  * The end of the transaction gives back every cell still held: those of
- * statements that failed. At a commit none should be left.
+ * statements that failed. At a commit none should be left; one that is
+ * shows a fault of the module, and the log says so.
  */
 static void
 pmu_xact_callback(XactEvent event, void *arg)
 {
 	switch (event)
 	{
-		case XACT_EVENT_ABORT:
-		case XACT_EVENT_PARALLEL_ABORT:
 		case XACT_EVENT_COMMIT:
 		case XACT_EVENT_PARALLEL_COMMIT:
 		case XACT_EVENT_PREPARE:
+			if (pmu_holds != NULL)
+				ereport(WARNING,
+						(errcode(ERRCODE_INTERNAL_ERROR),
+						 errmsg("internal error of pg_pmu: a cell of a statement was still held at the end of its transaction")));
+			pg_fallthrough;
+		case XACT_EVENT_ABORT:
+		case XACT_EVENT_PARALLEL_ABORT:
 			while (pmu_holds != NULL)
 				pmu_give_back_on_abort();
 			break;

@@ -47,11 +47,16 @@ FROM pg_shmem_allocations WHERE name = 'pg_pmu';
 -- spec: explain-pmu/The setting of the module
 \set VERBOSITY sqlstate
 SET pg_pmu.cell = 1;
+BEGIN;
+SET LOCAL pg_pmu.cell = 1;
+ROLLBACK;
 RESET pg_pmu.cell;
 SELECT set_config('pg_pmu.cell', '1', false);
 SELECT set_config('pg_pmu.cell', NULL, false);
 CREATE FUNCTION set_cell() RETURNS int LANGUAGE sql
   SET pg_pmu.cell = 1 AS 'SELECT 1';
+ALTER ROLE CURRENT_USER SET pg_pmu.cell = 1;
+ALTER SYSTEM SET pg_pmu.cell = 1;
 \set VERBOSITY default
 RESET ALL;
 SHOW pg_pmu.cell;
