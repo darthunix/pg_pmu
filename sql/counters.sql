@@ -275,8 +275,8 @@ SELECT * FROM pmu_explain($$
   SELECT nest(2)$$);
 
 -- A nested statement that fails inside two EXCEPTION blocks, the outer
--- one catching its error, gives its cell back in the abort of the inner
--- block: three in a row, then two nested at once, all find a cell.
+-- one catching its error, gives its cell back in an abort: three in a
+-- row, then two nested at once, all find a cell.
 CREATE FUNCTION fail_nested() RETURNS int
 LANGUAGE plpgsql AS $$
 BEGIN
