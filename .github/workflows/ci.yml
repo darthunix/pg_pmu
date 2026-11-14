@@ -1,0 +1,116 @@
+# Builds and tests of pg_pmu: the suites on PostgreSQL 19 and master,
+# at the revisions of postgres.env, on Linux and on macOS on Apple
+# silicon; the checks of the crate; its models of loom; its proofs of
+# Kani. A runner that cannot count passes the suites with their second
+# expected outputs; the step "Expected outputs" says which matched.
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  postgres:
+    name: PostgreSQL ${{ matrix.postgres }} (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, macos-15]
+        postgres: ['19', MASTER]
+    runs-on: ${{ matrix.os }}
+    env:
+      # The locale of the temporary servers of the suites.
+      LANG: C.UTF-8
+    steps:
+      - uses: actions/checkout@v4
+      - name: Revision
+        id: revision
+        run: |
+          . .github/postgres.env
+          eval "echo revision=\$POSTGRES_${{ matrix.postgres }}" >> "$GITHUB_OUTPUT"
+          echo "PG_CONFIG=$HOME/postgres/bin/pg_config" >> "$GITHUB_ENV"
+      - name: Build tools (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq bison flex zlib1g-dev
+      - uses: actions/cache@v4
+        id: postgres
+        with:
+          path: ~/postgres
+          key: postgres-${{ runner.os }}-${{ runner.arch }}-${{ steps.revision.outputs.revision }}-${{ hashFiles('.github/scripts/build-postgres.sh') }}
+      - name: Build PostgreSQL
+        if: steps.postgres.outputs.cache-hit != 'true'
+        run: .github/scripts/build-postgres.sh ${{ steps.revision.outputs.revision }} "$HOME/postgres"
+      # The module counts only where the kernel lets a process without
+      # privileges count itself.
+      - name: Allow counting (Linux)
+        if: runner.os == 'Linux'
+        run: sudo sysctl -w kernel.perf_event_paranoid=2
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: crates/pg_pmu_core -> target
+      - name: Checks of the crate
+        run: make check-crate
+      - name: Build and install
+        run: |
+          make COPT=-Werror
+          make install
+      - name: Suites
+        run: make installcheck EXTRA_REGRESS_OPTS="--temp-instance=$RUNNER_TEMP/cluster"
+      - name: Expected outputs
+        if: always()
+        run: |
+          for r in results/*.out output_unloaded/results/*.out; do
+            [ -f "$r" ] || continue
+            t=$(basename "$r" .out)
+            for e in expected/"$t".out expected/"$t"_[0-9].out; do
+              if [ -f "$e" ] && cmp -s "$r" "$e"; then
+                echo "$t matched $(basename "$e")"
+                continue 2
+              fi
+            done
+            echo "$t matched no expected output"
+          done
+      # Where the runner counts, the build without counters is the only
+      # one that shows the second expected outputs.
+      - name: Suites of the build without counters
+        run: |
+          make PG_PMU_COUNTERS=none COPT=-Werror
+          make PG_PMU_COUNTERS=none install
+          make PG_PMU_COUNTERS=none installcheck EXTRA_REGRESS_OPTS="--temp-instance=$RUNNER_TEMP/cluster-none"
+      - name: Differences and the server's log
+        if: failure()
+        run: |
+          cat regression.diffs output_unloaded/regression.diffs 2>/dev/null || true
+          grep -n -A30 -E 'TRAP:|terminated by signal' log/postmaster.log 2>/dev/null | head -300 || true
+          tail -n 50 log/postmaster.log 2>/dev/null || true
+
+  loom:
+    name: Models of loom
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: crates/pg_pmu_core -> target
+          key: loom
+      - name: Models of loom
+        working-directory: crates/pg_pmu_core
+        env:
+          RUSTFLAGS: --cfg loom
+        run: cargo test --release --test loom
+
+  kani:
+    name: Proofs of Kani
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: model-checking/kani-github-action@v1
+        with:
+          kani-version: '0.68.0'
+          working-directory: crates/pg_pmu_core
