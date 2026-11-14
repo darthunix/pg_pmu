@@ -30,7 +30,7 @@ EXPLAIN (ANALYZE, PMU, COSTS off, TIMING off, SUMMARY off)
 
 \set VERBOSITY default
 
--- spec: explain-pmu/A caught failure of a worker
+-- case: A caught failure of a worker
 DO $$
 BEGIN
   EXECUTE 'EXPLAIN (ANALYZE, PMU) SELECT caught()';

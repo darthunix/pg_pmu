@@ -1,10 +1,10 @@
 -- The option PMU, on a server that preloads pg_pmu. Nothing here
 -- needs counters.
--- spec: explain-pmu/Loaded at the start
+-- case: Loaded at the start
 -- On a server that preloads the module, LOAD finds it loaded and does
 -- nothing.
 LOAD 'pg_pmu';
--- spec: explain-pmu/Without ANALYZE
+-- case: Without ANALYZE
 \set VERBOSITY sqlstate
 EXPLAIN (PMU) SELECT 1;
 ERROR:  22023
@@ -18,7 +18,7 @@ ERROR:  EXPLAIN option PMU requires ANALYZE
 EXPLAIN (PMU maybe) SELECT 1;
 ERROR:  42601
 \set VERBOSITY default
--- spec: explain-pmu/Turned off
+-- case: Turned off
 EXPLAIN (ANALYZE, PMU off, COSTS off, TIMING off, SUMMARY off,
          BUFFERS off) SELECT 1;
             QUERY PLAN             
@@ -46,7 +46,7 @@ EXPLAIN (PMU false) SELECT 1;
  Result  (cost=0.00..0.01 rows=1 width=4)
 (1 row)
 
--- spec: explain-pmu/auto_explain
+-- case: auto_explain
 LOAD 'auto_explain';
 \set VERBOSITY sqlstate
 SET auto_explain.log_extension_options = 'pmu';
@@ -57,7 +57,7 @@ ERROR:  22023
 SET auto_explain.log_extension_options = 'pmu';
 ERROR:  EXPLAIN option "pmu" cannot be used by auto_explain
 DETAIL:  auto_explain explains a plan after it has run, when nothing was counted.
--- spec: explain-pmu/The size at the start
+-- case: The size at the start
 SELECT size = 16 + 32 * (current_setting('max_connections')::int
                          + current_setting('autovacuum_worker_slots')::int
                          + current_setting('max_worker_processes')::int
@@ -70,7 +70,7 @@ FROM pg_shmem_allocations WHERE name = 'pg_pmu';
  t
 (1 row)
 
--- spec: explain-pmu/The setting of the module
+-- case: The setting of the module
 \set VERBOSITY sqlstate
 SET pg_pmu.cell = 1;
 ERROR:  55P02
