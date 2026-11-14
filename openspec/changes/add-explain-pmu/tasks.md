@@ -99,7 +99,7 @@ with the lints of the design, and the commands each task names.
   atomics, and the tests of proptest in `tests/model.rs` against a
   plain model, with the bounds of the token and of the generation.
   Verify with the checks of the crate.
-- [ ] 4.2 Add the models of loom in `tests/loom.rs`, two or three
+- [x] 4.2 Add the models of loom in `tests/loom.rs`, two or three
   threads each: reports against a close; a late report with an old
   token against a close and a new taking; two backends racing for one
   cell of the pool; a nested cell handed down into the hold below
