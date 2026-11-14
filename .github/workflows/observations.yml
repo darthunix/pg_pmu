@@ -59,8 +59,7 @@ jobs:
           make && make install
       - name: The machine
         run: |
-          lscpu | grep -E 'Model name|^CPU\(s\)|Vendor'
-          uname -r
+          .github/scripts/machine.sh
           sudo sysctl -w kernel.perf_event_paranoid=2
       - name: A server
         run: |
@@ -79,7 +78,10 @@ jobs:
           psql -X -q -c "CREATE EXTENSION tessera" \
             -c "CREATE TABLE t AS SELECT g FROM generate_series(1, 100000) g" \
             -c "VACUUM ANALYZE t"
+      # A host that gives its virtual machine no PMU has nothing to
+      # observe.
       - name: Observations
+        if: env.COUNTS == 'true'
         run: .github/scripts/observe.sh
       - name: The server's log
         if: failure()
