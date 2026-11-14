@@ -746,6 +746,7 @@ system calls for that are few, and `libc` has the call itself.
   loom; `tests/counters.rs`: the tests on real counters; `tests/abi.rs`:
   the codes of the header against the crate's; `Cargo.lock`.
 - `pg_pmu_core.h`: the C declarations of the crate's functions.
+- `pg_pmu.h`: what the two C files of the module share.
 - `pg_pmu.c`: the option, the hooks, the frames, the depth, the
   records, the output, the errors of the counters.
 - `workers.c`: the request of the shared memory, the setting
@@ -758,7 +759,9 @@ system calls for that are few, and `libc` has the call itself.
 - `pg_pmu.conf`: the settings of the temporary server of the suite.
 - `sql/`, `expected/`: the regression suite.
 - `README.md`: loading, use, what the counts mean on each system.
-- `.github/workflows/ci.yml`: builds and tests.
+- `.github/workflows/ci.yml`: builds and tests;
+  `.github/postgres.env`: the revisions of PostgreSQL it builds;
+  `.github/scripts/build-postgres.sh`: the build of PostgreSQL.
 
 ## Tests
 
@@ -802,6 +805,18 @@ The suite `sql/unloaded.sql` runs on a second temporary server without
 the module: the option refused as unknown, and `LOAD` refused with
 55000.
 
+Three suites need a system of their own, and each has a target of its
+own. `sql/paranoid.sql` runs on Linux with `kernel.perf_event_paranoid`
+set to 4, where an Ubuntu kernel refuses the events: 42501 with its
+hint. `sql/vm.sql` runs in a virtual machine with macOS: 0A000.
+`sql/workers_cannot_count.sql` runs on a machine that counts, with a
+build of the module whose parallel workers fail to open their
+counters: a function that catches the error of such a worker does not
+save the statement. Of the runners of CI those of AArch64 Linux count,
+the x86-64 ones have no PMU, and those of macOS are virtual machines;
+so CI demands counts on AArch64 Linux, runs the first and the third
+suite there and the second on macOS.
+
 The crate has its own checks, run in `crates/pg_pmu_core` by
 `cargo test`, by `cargo test` with `--cfg loom` for the models of
 loom, and by `cargo kani`: the sizes and offsets of the layout; a
@@ -815,10 +830,10 @@ first, and a next opening that succeeds. The refusal of the crate is
 what its tests show; that C turns it into XX000 is shown by
 `test/abi.c` or checked by review.
 
-Checked by hand, as a test cannot make them: the errors of Linux when
-the kernel refuses the events and when all counters are taken; the
-recovery of the next statement after that; a worker that cannot count
-under a function that catches its error; an Intel Mac; connections
+Checked by hand, as a test cannot make them: the error of Linux when
+all counters are taken, and the recovery of the next statement after
+it; counting on a Mac with Apple silicon, by the suites with
+`installcheck-counted`; an Intel Mac; connections
 refused with `session_preload_libraries`, and a connection that gives
 `pg_pmu.cell` a value at its start (22023), whose failure pg_regress
 cannot print in a stable form; SQL run while the plan is printed,

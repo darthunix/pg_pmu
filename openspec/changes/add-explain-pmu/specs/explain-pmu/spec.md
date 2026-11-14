@@ -26,21 +26,24 @@ module on a server that preloads it does nothing.
   `shared_preload_libraries` and a session runs
   `EXPLAIN (ANALYZE, PMU) SELECT 1`
 - **THEN** the output has the counts
-- **Verified by:** pending
+- **Verified by:**
+  `sql/counters.sql::spec: explain-pmu/Loaded at the start`
 
 #### Scenario: Loaded later
 
 - **WHEN** a session of a server without `pg_pmu` in
   `shared_preload_libraries` runs `LOAD 'pg_pmu'`
 - **THEN** it fails with SQLSTATE 55000
-- **Verified by:** pending
+- **Verified by:**
+  `sql/unloaded.sql::spec: explain-pmu/Loaded later`
 
 #### Scenario: Not loaded
 
 - **WHEN** a session of a server without `pg_pmu` runs
   `EXPLAIN (ANALYZE, PMU) SELECT 1`
 - **THEN** PostgreSQL refuses the unknown option with SQLSTATE 42601
-- **Verified by:** pending
+- **Verified by:**
+  `sql/unloaded.sql::spec: explain-pmu/Not loaded`
 
 ### Requirement: The option PMU
 
@@ -56,26 +59,30 @@ explains a plan after it has run, when nothing was counted.
 
 - **WHEN** a session runs `EXPLAIN (ANALYZE, PMU) SELECT 1`
 - **THEN** the statement runs and the output has the counts
-- **Verified by:** pending
+- **Verified by:**
+  `sql/counters.sql::spec: explain-pmu/With ANALYZE`
 
 #### Scenario: Without ANALYZE
 
 - **WHEN** a session runs `EXPLAIN (PMU) SELECT 1`
 - **THEN** the statement fails with SQLSTATE 22023 and does not run
-- **Verified by:** pending
+- **Verified by:**
+  `sql/option.sql::spec: explain-pmu/Without ANALYZE`
 
 #### Scenario: Turned off
 
 - **WHEN** a session runs `EXPLAIN (ANALYZE, PMU off) SELECT 1`
 - **THEN** the output has no counts
-- **Verified by:** pending
+- **Verified by:**
+  `sql/option.sql::spec: explain-pmu/Turned off`
 
 #### Scenario: auto_explain
 
 - **WHEN** a session with auto_explain loaded sets
   `auto_explain.log_extension_options` to `pmu`
 - **THEN** the setting is refused with SQLSTATE 22023
-- **Verified by:** pending
+- **Verified by:**
+  `sql/option.sql::spec: explain-pmu/auto_explain`
 
 ### Requirement: Counts of the execution
 
@@ -108,13 +115,15 @@ measure each node of the plan; with `TIMING off` that work is smaller.
   workers and no JIT, runs over a table of 1000 rows and over a table
   of 100000 rows
 - **THEN** both counts of the larger table are larger
-- **Verified by:** pending
+- **Verified by:**
+  `sql/counters.sql::spec: explain-pmu/More rows, more work`
 
 #### Scenario: Work of a function
 
 - **WHEN** the statement calls a function that runs a query
 - **THEN** the counts include the work of that query
-- **Verified by:** pending
+- **Verified by:**
+  `sql/counters.sql::spec: explain-pmu/Work of a function`
 
 ### Requirement: Counts of the planning
 
@@ -129,7 +138,8 @@ EXPLAIN; that planning is counted nowhere.
 
 - **WHEN** a session runs `EXPLAIN (ANALYZE, PMU)` of a `SELECT`
 - **THEN** the output has counts of the planning and of the execution
-- **Verified by:** pending
+- **Verified by:**
+  `sql/counters.sql::spec: explain-pmu/A query planned by EXPLAIN`
 
 #### Scenario: A prepared statement
 
@@ -137,7 +147,8 @@ EXPLAIN; that planning is counted nowhere.
   prepared statement, the first time and again
 - **THEN** each output has counts of the execution and none of the
   planning
-- **Verified by:** pending
+- **Verified by:**
+  `sql/counters.sql::spec: explain-pmu/A prepared statement`
 
 ### Requirement: The output
 
@@ -160,14 +171,16 @@ no counts.
 - **WHEN** a session runs `EXPLAIN (ANALYZE, PMU) SELECT 1`
 - **THEN** the output has one line `Planning PMU:` and one line
   `Execution PMU:`, each with two positive integers
-- **Verified by:** pending
+- **Verified by:**
+  `sql/counters.sql::spec: explain-pmu/Text`
 
 #### Scenario: JSON and YAML
 
 - **WHEN** a session runs `EXPLAIN (ANALYZE, PMU)` of `SELECT 1` with
   `FORMAT JSON` and with `FORMAT YAML`
 - **THEN** the query has the four properties, each a positive integer
-- **Verified by:** pending
+- **Verified by:**
+  `sql/counters.sql::spec: explain-pmu/JSON and YAML`
 
 #### Scenario: XML
 
@@ -176,21 +189,24 @@ no counts.
 - **THEN** the query has the four elements, from
   `Planning-Instructions` to `Execution-Cycles`, each a positive
   integer
-- **Verified by:** pending
+- **Verified by:**
+  `sql/counters.sql::spec: explain-pmu/XML`
 
 #### Scenario: A rule makes two plans
 
 - **WHEN** a session explains an `INSERT` into a table with a rule
   `ALSO INSERT` into another table
 - **THEN** each of the two plans has its own counts
-- **Verified by:** pending
+- **Verified by:**
+  `sql/counters.sql::spec: explain-pmu/A rule makes two plans`
 
 #### Scenario: No plan
 
 - **WHEN** a session explains an `INSERT` into a table with a rule
   `DO INSTEAD NOTHING`
 - **THEN** the output has no counts
-- **Verified by:** pending
+- **Verified by:**
+  `sql/counters.sql::spec: explain-pmu/No plan`
 
 ### Requirement: The part of the parallel workers
 
@@ -219,14 +235,16 @@ execution.
   100000 rows
 - **THEN** the plan shows launched workers, and the part of the
   workers is positive and not larger than the counts of the execution
-- **Verified by:** pending
+- **Verified by:**
+  `sql/counters.sql::spec: explain-pmu/The workers do the scan`
 
 #### Scenario: No workers
 
 - **WHEN** a session with `debug_parallel_query` off runs
   `EXPLAIN (ANALYZE, PMU, VERBOSE)` of a plan without parallel workers
 - **THEN** the output has no part of the workers
-- **Verified by:** pending
+- **Verified by:**
+  `sql/counters.sql::spec: explain-pmu/No workers`
 
 #### Scenario: A hidden Gather
 
@@ -235,14 +253,16 @@ execution.
   can run in a worker
 - **THEN** the output has no Gather and has a positive part of the
   workers
-- **Verified by:** pending
+- **Verified by:**
+  `sql/counters.sql::spec: explain-pmu/A hidden Gather`
 
 #### Scenario: In a worker
 
 - **WHEN** a parallel-safe function that a worker runs below a Gather
   runs `EXPLAIN (ANALYZE, PMU, VERBOSE)`
 - **THEN** it succeeds and shows no part of the workers
-- **Verified by:** pending
+- **Verified by:**
+  `sql/counters.sql::spec: explain-pmu/In a worker`
 
 ### Requirement: Nested counting statements
 
@@ -279,7 +299,8 @@ given at connection start fails with SQLSTATE 22023.
   positive part of the workers, not larger than its counts of the
   execution; the outer counts of the execution are larger than the
   inner ones
-- **Verified by:** pending
+- **Verified by:**
+  `sql/counters.sql::spec: explain-pmu/Inside a parallel plan`
 
 #### Scenario: A nested statement fails
 
@@ -288,7 +309,8 @@ given at connection start fails with SQLSTATE 22023.
   parallel query, which fails, and catches the error
 - **THEN** the outer statement succeeds and shows a positive part of
   the workers
-- **Verified by:** pending
+- **Verified by:**
+  `sql/counters.sql::spec: explain-pmu/A nested statement fails`
 
 #### Scenario: Two nested statements fail together
 
@@ -298,7 +320,8 @@ given at connection start fails with SQLSTATE 22023.
   fails
 - **THEN** the outer statement succeeds and shows a positive part of
   the workers
-- **Verified by:** pending
+- **Verified by:**
+  `sql/counters.sql::spec: explain-pmu/Two nested statements fail together`
 
 #### Scenario: No free place
 
@@ -306,7 +329,8 @@ given at connection start fails with SQLSTATE 22023.
   three nested counting statements would be open at once
 - **THEN** the third fails with SQLSTATE 53000 before it runs, and a
   nested statement after it works again
-- **Verified by:** pending
+- **Verified by:**
+  `sql/counters.sql::spec: explain-pmu/No free place`
 
 #### Scenario: The setting of the module
 
@@ -314,7 +338,8 @@ given at connection start fails with SQLSTATE 22023.
   and makes a function with `SET pg_pmu.cell = 1`
 - **THEN** each fails with SQLSTATE 55P02, and `RESET ALL` succeeds
   and leaves the setting as it was
-- **Verified by:** pending
+- **Verified by:**
+  `sql/option.sql::spec: explain-pmu/The setting of the module`
 
 ### Requirement: Counting on each system
 
@@ -345,7 +370,10 @@ not comparable.
 
 - **WHEN** the Linux kernel lets the process open and read the events
 - **THEN** `EXPLAIN (ANALYZE, PMU)` shows the counts
-- **Verified by:** pending
+- **Verified by:**
+  `sql/counters.sql::spec: explain-pmu/Linux, counting allowed`,
+  checked by `make installcheck-counted` on the AArch64 Linux runners
+  of CI, which count
 
 #### Scenario: Linux, counting refused
 
@@ -354,21 +382,29 @@ not comparable.
 - **THEN** the statement fails with SQLSTATE 42501, the error of the
   system, and a hint that names the setting, the capabilities and the
   filters of containers
-- **Verified by:** pending
+- **Verified by:**
+  `sql/paranoid.sql::spec: explain-pmu/Linux, counting refused`,
+  run by `make installcheck-paranoid` on the AArch64 Linux runners of
+  CI
 
 #### Scenario: Apple silicon
 
 - **WHEN** the server runs on a Mac with Apple silicon, not in a
   virtual machine
 - **THEN** `EXPLAIN (ANALYZE, PMU)` shows the counts
-- **Verified by:** pending
+- **Verified by:**
+  `sql/counters.sql::spec: explain-pmu/Apple silicon`,
+  checked by `make installcheck-counted` on a Mac with Apple silicon;
+  the macOS runners of CI are virtual machines
 
 #### Scenario: A virtual machine with macOS
 
 - **WHEN** the server runs in a virtual machine with macOS whose
   kernel reports no instructions
 - **THEN** the statement fails with SQLSTATE 0A000
-- **Verified by:** pending
+- **Verified by:**
+  `sql/vm.sql::spec: explain-pmu/A virtual machine with macOS`,
+  run by `make installcheck-vm` on the macOS runners of CI
 
 ### Requirement: When the system cannot count
 
@@ -400,7 +436,8 @@ counts again.
   `EXPLAIN (ANALYZE, PMU) SELECT nextval('s')`
 - **THEN** the statement fails with one of the SQLSTATEs above, and
   the sequence `s` is not advanced
-- **Verified by:** pending
+- **Verified by:**
+  `sql/counters.sql::spec: explain-pmu/Nothing runs`
 
 #### Scenario: A caught failure of a worker
 
@@ -408,7 +445,11 @@ counts again.
   statement catches its error
 - **THEN** the counting statement fails at its end with the worker's
   SQLSTATE
-- **Verified by:** pending
+- **Verified by:**
+  `sql/workers_cannot_count.sql::spec: explain-pmu/A caught failure of a worker`,
+  run by `make installcheck-workers-cannot-count` with the build
+  `PG_PMU_TEST=workers-cannot-count` on the AArch64 Linux runners of
+  CI
 
 ### Requirement: The shared memory of the workers
 
@@ -486,7 +527,8 @@ SQLSTATE XX000 before it runs, until the restart.
 - **WHEN** the server starts with `pg_pmu.max_nested` set to K
 - **THEN** the column `size` of `pg_shmem_allocations` shows "pg_pmu"
   with 16 + 32 * (N + K) bytes
-- **Verified by:** pending
+- **Verified by:**
+  `sql/option.sql::spec: explain-pmu/The size at the start`
 
 #### Scenario: A report after the return
 
@@ -494,7 +536,8 @@ SQLSTATE XX000 before it runs, until the restart.
   returned, and taken again or not
 - **THEN** the report is refused and the sums of the cell do not
   change
-- **Verified by:** pending
+- **Verified by:**
+  `crates/pg_pmu_core/tests/loom.rs::a_late_report_against_a_new_taking`
 
 #### Scenario: A token that is not valid
 
@@ -502,11 +545,13 @@ SQLSTATE XX000 before it runs, until the restart.
   or above N + K, whose G is even, or whose decimal form is not a
   number below 2^64
 - **THEN** the report is refused and no cell changes
-- **Verified by:** pending
+- **Verified by:**
+  `crates/pg_pmu_core/tests/ffi.rs::tokens_are_read_from_the_setting`
 
 #### Scenario: A return while a worker adds
 
 - **WHEN** a statement returns its cell while a worker is between
   raising and lowering W
 - **THEN** the return is refused, and the worker's addition is kept
-- **Verified by:** pending
+- **Verified by:**
+  `crates/pg_pmu_core/tests/loom.rs::reports_against_a_close`
