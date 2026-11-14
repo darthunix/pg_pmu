@@ -149,11 +149,15 @@ impl<B: Backend> Counters<B> {
                 self.refs = refs;
                 Ok(counts)
             }
-            Err(error) => {
+            Err(mut error) => {
                 if self.refs == 0 {
                     // The read already failed; that error is the one to
-                    // report.
+                    // report. A counter lost right after it was enabled
+                    // was never free.
                     let _ = self.backend.disable();
+                    if error.status == Status::CounterLost {
+                        error.status = Status::NoFreeCounter;
+                    }
                 }
                 Err(error)
             }
@@ -264,7 +268,8 @@ mod tests {
             ..Fake::default()
         });
         c.open().unwrap();
-        assert_eq!(c.acquire().unwrap_err().status, Status::CounterLost);
+        // Lost right after it was enabled: it was never free.
+        assert_eq!(c.acquire().unwrap_err().status, Status::NoFreeCounter);
         assert_eq!(c.refs(), 0);
         assert!(!c.backend().enabled);
     }

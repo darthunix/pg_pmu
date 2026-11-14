@@ -32,6 +32,7 @@
 #define PMU_COUNTER_LOST		8	/* 53000 */
 #define PMU_SYSTEM_ERROR		9	/* XX000 */
 #define PMU_INTERNAL			10	/* XX000 */
+#define PMU_TOO_MANY_KINDS		11	/* 0A000 */
 
 /* Instructions and cycles counted so far; only differences mean much. */
 typedef struct PmuCounts

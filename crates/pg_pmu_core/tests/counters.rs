@@ -21,26 +21,43 @@ fn work(n: u64) -> u64 {
     x
 }
 
+/// The codes of a machine that cannot count.
+fn cannot_count(status: Status) -> bool {
+    matches!(
+        status,
+        Status::NoSystem
+            | Status::NoCounters
+            | Status::NotPermitted
+            | Status::CoresNotCovered
+            | Status::KindNotOpenable
+            | Status::TooManyKinds
+            | Status::NoFreeCounter
+    )
+}
+
+/// Plan and open the counters of this machine, or return `None` where
+/// it cannot count, unless PG_PMU_REQUIRE_COUNTERS says it must.
+fn counters() -> Option<Counters<pg_pmu_core::counters::Platform>> {
+    let mut c = Counters::new(platform());
+    match c.plan(c"/sys").and_then(|_| c.open()) {
+        Ok(()) => Some(c),
+        Err(e) => {
+            assert!(cannot_count(e.status), "{e:?}");
+            assert!(
+                std::env::var_os("PG_PMU_REQUIRE_COUNTERS").is_none(),
+                "this machine must count, but: {e:?}"
+            );
+            eprintln!("this machine cannot count: {e:?}");
+            None
+        }
+    }
+}
+
 #[test]
 fn counts_grow_with_the_work() {
-    let mut c = Counters::new(platform());
-    c.plan(c"/sys").expect("plan");
-    if let Err(e) = c.open() {
-        assert!(
-            matches!(
-                e.status,
-                Status::NoSystem | Status::NoCounters | Status::NotPermitted
-            ),
-            "{e:?}"
-        );
-        // A machine that must count says so, and then this fails.
-        assert!(
-            std::env::var_os("PG_PMU_REQUIRE_COUNTERS").is_none(),
-            "this machine must count, but: {e:?}"
-        );
-        eprintln!("this machine cannot count: {e:?}");
+    let Some(mut c) = counters() else {
         return;
-    }
+    };
     let start = c.acquire().expect("acquire");
     std::hint::black_box(work(10_000_000));
     let end = c.read().expect("read");
@@ -52,27 +69,20 @@ fn counts_grow_with_the_work() {
 
 #[test]
 fn opening_twice_does_nothing_more() {
-    let mut c = Counters::new(platform());
-    let first = c.open();
-    assert_eq!(c.open(), first);
-    if first.is_ok() {
-        assert_eq!(c.plan(c"/sys"), Ok(0));
-    }
+    let Some(mut c) = counters() else {
+        return;
+    };
+    assert_eq!(c.open(), Ok(()));
+    assert_eq!(c.plan(c"/sys"), Ok(0));
 }
 
 /// On Linux the counters count only while a reference is held.
 #[cfg(target_os = "linux")]
 #[test]
 fn disabled_counters_do_not_count() {
-    let mut c = Counters::new(platform());
-    if let Err(e) = c.plan(c"/sys").and_then(|_| c.open()) {
-        assert!(
-            std::env::var_os("PG_PMU_REQUIRE_COUNTERS").is_none(),
-            "this machine must count, but: {e:?}"
-        );
-        eprintln!("this machine cannot count: {e:?}");
+    let Some(mut c) = counters() else {
         return;
-    }
+    };
     let before = c.acquire().expect("acquire");
     c.release().expect("release");
     std::hint::black_box(work(10_000_000));

@@ -31,6 +31,9 @@ pub enum Status {
     SystemError = 9,
     /// XX000: the module called the crate out of order.
     Internal = 10,
+    /// 0A000: the processor has more kinds of cores than the crate
+    /// counts on.
+    TooManyKinds = 11,
 }
 
 /// A code with the error of the system, `errno`, where there is one,

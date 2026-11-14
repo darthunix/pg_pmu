@@ -699,6 +699,12 @@ pmu_report(int32 status, int32 os_error)
 					 errmsg("the kinds of cores in sysfs do not cover all the processors online"),
 					 errdetail("Counting on some cores only would show a part of the work.")));
 			break;
+		case PMU_TOO_MANY_KINDS:
+			ereport(ERROR,
+					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					 errmsg("the processor has more kinds of cores than pg_pmu counts on"),
+					 errdetail("It counts on up to four kinds.")));
+			break;
 		case PMU_KIND_NOT_OPENABLE:
 			ereport(ERROR,
 					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),

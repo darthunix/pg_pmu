@@ -6,8 +6,9 @@
 -- pg_pmu and of times replaced by N, as they change from run to run, in
 -- every format; or one line
 -- when the system cannot count, whichever of its three codes it fails
--- with. The codes are matched exactly: a condition name would take in
--- its whole class, such as disk_full beside insufficient_resources.
+-- with. The codes are compared exactly: PL/pgSQL matches a condition
+-- whose code ends in 000, such as SQLSTATE '53000', against its whole
+-- class, which would take in disk_full beside insufficient_resources.
 CREATE FUNCTION pmu_explain(query text) RETURNS SETOF text
 LANGUAGE plpgsql AS $$
 DECLARE
@@ -24,10 +25,26 @@ BEGIN
       FROM regexp_split_to_table(line, E'\n') WITH ORDINALITY AS x(l, n));
   END LOOP;
 EXCEPTION
-  WHEN SQLSTATE '42501' OR SQLSTATE '0A000' OR SQLSTATE '53000' THEN
-    RETURN NEXT 'cannot count';
+  WHEN OTHERS THEN
+    IF SQLSTATE IN ('42501', '0A000', '53000') THEN
+      RETURN NEXT 'cannot count';
+    ELSE
+      RAISE;
+    END IF;
 END
 $$;
+
+-- Another error of the class 53, from the statement itself, is not
+-- taken for a system that cannot count.
+CREATE FUNCTION raise_code(code text) RETURNS int
+LANGUAGE plpgsql AS $$
+BEGIN
+  RAISE EXCEPTION 'raised' USING ERRCODE = code;
+END
+$$;
+\set VERBOSITY sqlstate
+SELECT * FROM pmu_explain($$EXPLAIN (ANALYZE, PMU) SELECT raise_code('53100')$$);
+\set VERBOSITY default
 
 -- spec: explain-pmu/Nothing runs
 -- Where the system cannot count, the statement fails before it runs:
@@ -48,8 +65,12 @@ BEGIN
   EXECUTE query INTO doc;
   RETURN doc::jsonb -> 0;
 EXCEPTION
-  WHEN SQLSTATE '42501' OR SQLSTATE '0A000' OR SQLSTATE '53000' THEN
-    RETURN NULL;
+  WHEN OTHERS THEN
+    IF SQLSTATE IN ('42501', '0A000', '53000') THEN
+      RETURN NULL;
+    ELSE
+      RAISE;
+    END IF;
 END
 $$;
 
@@ -132,8 +153,12 @@ DO $$
 BEGIN
   EXECUTE 'EXPLAIN (ANALYZE, PMU) SELECT 1; SELECT count(*) FROM small';
 EXCEPTION
-  WHEN SQLSTATE '42501' OR SQLSTATE '0A000' OR SQLSTATE '53000' THEN
-    RAISE NOTICE 'cannot count';
+  WHEN OTHERS THEN
+    IF SQLSTATE IN ('42501', '0A000', '53000') THEN
+      RAISE NOTICE 'cannot count';
+    ELSE
+      RAISE;
+    END IF;
 END
 $$;
 
@@ -165,8 +190,12 @@ BEGIN
     RAISE NOTICE 'the EXPLAIN failed';
   END;
 EXCEPTION
-  WHEN SQLSTATE '42501' OR SQLSTATE '0A000' OR SQLSTATE '53000' THEN
-    RAISE NOTICE 'cannot count';
+  WHEN OTHERS THEN
+    IF SQLSTATE IN ('42501', '0A000', '53000') THEN
+      RAISE NOTICE 'cannot count';
+    ELSE
+      RAISE;
+    END IF;
 END
 $$;
 SELECT * FROM pmu_explain($$
