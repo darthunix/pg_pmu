@@ -147,11 +147,42 @@ SELECT * FROM pmu_explain($$
   EXPLAIN (ANALYZE, PMU, COSTS off, TIMING off, SUMMARY off, BUFFERS off)
   INSERT INTO nothing VALUES (1)$$);
 
--- An EXPLAIN followed by other statements in one call of SPI: its frame
--- ends with it, and what follows is not taken for it.
+-- An EXPLAIN at the depth of the top level, where a DO block runs its
+-- statements.
 DO $$
+DECLARE
+  line text;
 BEGIN
-  EXECUTE 'EXPLAIN (ANALYZE, PMU) SELECT 1; SELECT count(*) FROM small';
+  FOR line IN EXECUTE 'EXPLAIN (ANALYZE, PMU, COSTS off, TIMING off,
+                       SUMMARY off, BUFFERS off) SELECT count(*) FROM small'
+  LOOP
+    RAISE NOTICE '%', regexp_replace(line, '[0-9]+', 'N', 'g');
+  END LOOP;
+EXCEPTION
+  WHEN OTHERS THEN
+    IF SQLSTATE IN ('42501', '0A000', '53000') THEN
+      RAISE NOTICE 'cannot count';
+    ELSE
+      RAISE;
+    END IF;
+END
+$$;
+
+-- An EXPLAIN with other statements in one call of SPI: its frame ends
+-- with it, the statement after it runs as usual, and an EXPLAIN after
+-- another statement counts.
+DO $$
+DECLARE
+  n bigint;
+  doc text;
+BEGIN
+  EXECUTE 'EXPLAIN (ANALYZE, PMU) SELECT 1; SELECT count(*) FROM small'
+    INTO n;
+  RAISE NOTICE 'the statement after the EXPLAIN counted % rows', n;
+  EXECUTE 'SELECT 1; EXPLAIN (ANALYZE, PMU, FORMAT JSON) SELECT 2'
+    INTO doc;
+  RAISE NOTICE 'the EXPLAIN after a statement counted: %',
+    (doc::jsonb -> 0 ->> 'Execution Instructions')::numeric > 0;
 EXCEPTION
   WHEN OTHERS THEN
     IF SQLSTATE IN ('42501', '0A000', '53000') THEN
@@ -163,7 +194,8 @@ END
 $$;
 
 -- A parameter of EXPLAIN EXECUTE that opens a cursor: the cursor's
--- executor does not finish inside the EXPLAIN, and is not taken for it.
+-- executor is still open when the plan is printed, and the record of the
+-- statement itself is found beside it.
 CREATE FUNCTION open_cursor() RETURNS refcursor
 LANGUAGE plpgsql AS $$
 DECLARE

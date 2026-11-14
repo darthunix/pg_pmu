@@ -92,6 +92,30 @@ static PmuFrame *pmu_frames = NULL;
  */
 static int	pmu_depth = 0;
 
+/*
+ * Make a call of a hook one level deeper, and come back to the depth
+ * after an error too. Only depths inside a frame are compared, so
+ * without a frame the call goes as it is, at no cost.
+ */
+#define PMU_DEEPER(call) \
+	do { \
+		if (pmu_frames == NULL) \
+			call; \
+		else \
+		{ \
+			pmu_depth++; \
+			PG_TRY(); \
+			{ \
+				call; \
+			} \
+			PG_FINALLY(); \
+			{ \
+				pmu_depth--; \
+			} \
+			PG_END_TRY(); \
+		} \
+	} while (0)
+
 /* pg_pmu.max_nested: nested counting statements the server runs at once */
 static int	pmu_max_nested = 16;
 
@@ -123,6 +147,7 @@ static void pmu_validate_options(ExplainState *es, List *options,
 								 ParseState *pstate);
 static void pmu_read(PmuCounts *now);
 static void pmu_frame_pop(PmuFrame *frame, bool report);
+static void pmu_free_records(PmuFrame *frame);
 static PmuRecord *pmu_find_record(QueryDesc *query);
 static void pmu_print(ExplainState *es, const char *phase,
 					  const PmuCounts *start, const PmuCounts *end);
@@ -356,31 +381,48 @@ pmu_ProcessUtility(PlannedStmt *pstmt, const char *queryString,
 static void
 pmu_frame_pop(PmuFrame *frame, bool report)
 {
+	bool		referenced = frame->referenced;
+
 	Assert(pmu_frames == frame);
 	pmu_frames = frame->prev;
-	frame->records = NULL;
+	pmu_free_records(frame);
+	pfree(frame);
 
-	if (frame->referenced)
+	if (referenced)
 	{
 		int32		os_error = 0;
 		int32		status = pmu_counters_release(&os_error);
 
-		frame->referenced = false;
 		if (status != PMU_OK && report)
 			pmu_report(status, os_error);
 	}
 }
 
+static void
+pmu_free_records(PmuFrame *frame)
+{
+	while (frame->records != NULL)
+	{
+		PmuRecord  *r = frame->records;
+
+		frame->records = r->next;
+		pfree(r);
+	}
+}
+
 /*
- * The record of an execution that has not ended, in any frame.
+ * The record of an execution that has not ended, in a frame at the
+ * present depth. A query dropped without its end leaves its record
+ * behind, and a later query at another depth may get its address.
  */
 static PmuRecord *
 pmu_find_record(QueryDesc *query)
 {
 	for (PmuFrame *f = pmu_frames; f != NULL; f = f->prev)
-		for (PmuRecord *r = f->records; r != NULL; r = r->next)
-			if (r->query == query)
-				return r;
+		if (f->depth == pmu_depth)
+			for (PmuRecord *r = f->records; r != NULL; r = r->next)
+				if (r->query == query)
+					return r;
 	return NULL;
 }
 
@@ -407,21 +449,8 @@ pmu_planner(Query *parse, const char *query_string, int cursorOptions,
 	if (state != NULL)
 		pmu_read(&start);
 
-	pmu_depth++;
-	PG_TRY();
-	{
-		if (prev_planner)
-			result = prev_planner(parse, query_string, cursorOptions,
-								  boundParams, es);
-		else
-			result = standard_planner(parse, query_string, cursorOptions,
-									  boundParams, es);
-	}
-	PG_FINALLY();
-	{
-		pmu_depth--;
-	}
-	PG_END_TRY();
+	PMU_DEEPER(result = (prev_planner ? prev_planner : standard_planner)
+			   (parse, query_string, cursorOptions, boundParams, es));
 
 	if (state != NULL)
 	{
@@ -453,37 +482,15 @@ pmu_ExecutorStart(QueryDesc *queryDesc, int eflags)
 		frame->records = record;
 	}
 
-	pmu_depth++;
-	PG_TRY();
-	{
-		if (prev_ExecutorStart)
-			prev_ExecutorStart(queryDesc, eflags);
-		else
-			standard_ExecutorStart(queryDesc, eflags);
-	}
-	PG_FINALLY();
-	{
-		pmu_depth--;
-	}
-	PG_END_TRY();
+	PMU_DEEPER((prev_ExecutorStart ? prev_ExecutorStart :
+				standard_ExecutorStart) (queryDesc, eflags));
 }
 
 static void
 pmu_ExecutorRun(QueryDesc *queryDesc, ScanDirection direction, uint64 count)
 {
-	pmu_depth++;
-	PG_TRY();
-	{
-		if (prev_ExecutorRun)
-			prev_ExecutorRun(queryDesc, direction, count);
-		else
-			standard_ExecutorRun(queryDesc, direction, count);
-	}
-	PG_FINALLY();
-	{
-		pmu_depth--;
-	}
-	PG_END_TRY();
+	PMU_DEEPER((prev_ExecutorRun ? prev_ExecutorRun :
+				standard_ExecutorRun) (queryDesc, direction, count));
 }
 
 /*
@@ -495,19 +502,8 @@ pmu_ExecutorFinish(QueryDesc *queryDesc)
 {
 	PmuRecord  *record;
 
-	pmu_depth++;
-	PG_TRY();
-	{
-		if (prev_ExecutorFinish)
-			prev_ExecutorFinish(queryDesc);
-		else
-			standard_ExecutorFinish(queryDesc);
-	}
-	PG_FINALLY();
-	{
-		pmu_depth--;
-	}
-	PG_END_TRY();
+	PMU_DEEPER((prev_ExecutorFinish ? prev_ExecutorFinish :
+				standard_ExecutorFinish) (queryDesc));
 
 	record = pmu_find_record(queryDesc);
 	if (record != NULL && !record->finished)
@@ -529,7 +525,10 @@ pmu_ExecutorEnd(QueryDesc *queryDesc)
 		for (PmuRecord **r = &f->records; *r != NULL; r = &(*r)->next)
 			if ((*r)->query == queryDesc)
 			{
-				*r = (*r)->next;
+				PmuRecord  *ended = *r;
+
+				*r = ended->next;
+				pfree(ended);
 				break;
 			}
 
@@ -573,8 +572,9 @@ pmu_print(ExplainState *es, const char *phase, const PmuCounts *start,
  * The hook that runs for each plan after EXPLAIN ANALYZE has run and
  * printed it, before the executor ends: print the counts of its planning,
  * if this EXPLAIN planned it, and those of the record of this plan whose
- * execution has not ended, then forget the frame's records. It does nothing for an EXPLAIN without the option, and for the
- * plans auto_explain logs.
+ * execution has not ended, then forget the frame's records. It does
+ * nothing for an EXPLAIN without the option, and for the plans
+ * auto_explain logs.
  */
 static void
 pmu_explain_per_plan(PlannedStmt *plannedstmt, IntoClause *into,
@@ -608,7 +608,7 @@ pmu_explain_per_plan(PlannedStmt *plannedstmt, IntoClause *into,
 		pmu_print(es, "Planning", &state->plan_start, &state->plan_end);
 	state->planned = NULL;
 	pmu_print(es, "Execution", &record->start, &record->finish);
-	state->frame->records = NULL;
+	pmu_free_records(state->frame);
 }
 
 /*
