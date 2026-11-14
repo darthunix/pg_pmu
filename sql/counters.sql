@@ -46,7 +46,7 @@ $$;
 SELECT * FROM pmu_explain($$EXPLAIN (ANALYZE, PMU) SELECT raise_code('53100')$$);
 \set VERBOSITY default
 
--- spec: explain-pmu/Nothing runs
+-- case: Nothing runs
 -- Where the system cannot count, the statement fails before it runs:
 -- the sequence, which a rollback does not move back, is not advanced.
 CREATE SEQUENCE s;
@@ -82,13 +82,13 @@ CREATE TABLE small AS SELECT g FROM generate_series(1, 1000) g;
 CREATE TABLE big AS SELECT g FROM generate_series(1, 100000) g;
 ANALYZE small, big;
 
--- spec: explain-pmu/Loaded at the start
--- spec: explain-pmu/With ANALYZE
--- spec: explain-pmu/Text
+-- case: Loaded at the start
+-- case: With ANALYZE
+-- case: Text
 -- On a system that counts, the counts; checked there by
 -- "make installcheck-counted".
--- spec: explain-pmu/Linux, counting allowed
--- spec: explain-pmu/Apple silicon
+-- case: Linux, counting allowed
+-- case: Apple silicon
 SELECT * FROM pmu_explain($$
   EXPLAIN (ANALYZE, PMU, COSTS off, TIMING off, BUFFERS off) SELECT 1$$);
 
@@ -97,7 +97,7 @@ SELECT * FROM pmu_explain($$
   EXPLAIN (ANALYZE, PMU, COSTS off, TIMING off, SUMMARY off, BUFFERS off)
   SELECT 1$$);
 
--- spec: explain-pmu/JSON and YAML
+-- case: JSON and YAML
 SELECT * FROM pmu_explain($$
   EXPLAIN (ANALYZE, PMU, COSTS off, TIMING off, SUMMARY off, BUFFERS off,
            FORMAT JSON) SELECT 1$$);
@@ -108,12 +108,12 @@ SELECT k, (j ->> k)::numeric > 0 AS positive
 FROM pmu_json($$EXPLAIN (ANALYZE, PMU, FORMAT JSON) SELECT 1$$) j,
      unnest(ARRAY['Execution Instructions', 'Execution Cycles']) k;
 
--- spec: explain-pmu/XML
+-- case: XML
 SELECT * FROM pmu_explain($$
   EXPLAIN (ANALYZE, PMU, COSTS off, TIMING off, SUMMARY off, BUFFERS off,
            FORMAT XML) SELECT 1$$);
 
--- spec: explain-pmu/More rows, more work
+-- case: More rows, more work
 WITH s AS (SELECT pmu_json($$EXPLAIN (ANALYZE, PMU, FORMAT JSON)
                              SELECT count(*) FROM small$$) j),
      b AS (SELECT pmu_json($$EXPLAIN (ANALYZE, PMU, FORMAT JSON)
@@ -121,7 +121,7 @@ WITH s AS (SELECT pmu_json($$EXPLAIN (ANALYZE, PMU, FORMAT JSON)
 SELECT k, (b.j ->> k)::numeric > (s.j ->> k)::numeric AS larger
 FROM s, b, unnest(ARRAY['Execution Instructions', 'Execution Cycles']) k;
 
--- spec: explain-pmu/Work of a function
+-- case: Work of a function
 CREATE FUNCTION count_big() RETURNS bigint
 LANGUAGE plpgsql AS $$
 BEGIN
@@ -136,7 +136,7 @@ SELECT (f.j ->> 'Execution Instructions')::numeric
        > (q.j ->> 'Execution Instructions')::numeric / 2 AS includes_its_query
 FROM f, q;
 
--- spec: explain-pmu/A rule makes two plans
+-- case: A rule makes two plans
 CREATE TABLE ruled (a int);
 CREATE TABLE copied (a int);
 CREATE RULE copy AS ON INSERT TO ruled DO ALSO INSERT INTO copied VALUES (new.a);
@@ -144,7 +144,7 @@ SELECT * FROM pmu_explain($$
   EXPLAIN (ANALYZE, PMU, COSTS off, TIMING off, SUMMARY off, BUFFERS off)
   INSERT INTO ruled VALUES (1)$$);
 
--- spec: explain-pmu/No plan
+-- case: No plan
 CREATE TABLE nothing (a int);
 CREATE RULE none AS ON INSERT TO nothing DO INSTEAD NOTHING;
 SELECT * FROM pmu_explain($$
@@ -238,13 +238,13 @@ SELECT * FROM pmu_explain($$
   EXPLAIN (ANALYZE, PMU, COSTS off, TIMING off, SUMMARY off, BUFFERS off)
   SELECT 1$$);
 
--- spec: explain-pmu/A query planned by EXPLAIN
+-- case: A query planned by EXPLAIN
 SELECT k, (j ->> k)::numeric > 0 AS positive
 FROM pmu_json($$EXPLAIN (ANALYZE, PMU, FORMAT JSON)
                 SELECT count(*) FROM small$$) j,
      unnest(ARRAY['Planning Instructions', 'Planning Cycles']) k;
 
--- spec: explain-pmu/A prepared statement
+-- case: A prepared statement
 -- The cache of prepared statements makes the plan, also during the
 -- EXPLAIN, and that planning is not counted.
 PREPARE count_small AS SELECT count(*) FROM small;
@@ -269,7 +269,7 @@ BEGIN
 END
 $$;
 
--- spec: explain-pmu/No free place
+-- case: No free place
 \set VERBOSITY sqlstate
 EXPLAIN (ANALYZE, PMU, COSTS off, TIMING off, SUMMARY off, BUFFERS off)
   SELECT nest(3);
@@ -317,12 +317,12 @@ LANGUAGE sql AS $$
 $$;
 RESET max_parallel_workers_per_gather;
 
--- spec: explain-pmu/No workers
+-- case: No workers
 SELECT pmu_json($$EXPLAIN (ANALYZE, PMU, VERBOSE, FORMAT JSON)
                   SELECT count(*) FROM small$$) ? 'Workers Instructions'
        AS has_part_of_workers;
 
--- spec: explain-pmu/A hidden Gather
+-- case: A hidden Gather
 SET debug_parallel_query = regress;
 SELECT j::text NOT LIKE '%Gather%' AS gather_hidden,
        (j ->> 'Workers Instructions')::numeric > 0 AS workers_counted
@@ -335,7 +335,7 @@ SET parallel_setup_cost = 0;
 SET parallel_tuple_cost = 0;
 SET min_parallel_table_scan_size = 0;
 
--- spec: explain-pmu/The workers do the scan
+-- case: The workers do the scan
 SET parallel_leader_participation = off;
 SELECT * FROM pmu_workers($$EXPLAIN (ANALYZE, PMU, VERBOSE, FORMAT JSON)
                             SELECT count(*) FROM big$$);
@@ -345,7 +345,7 @@ SELECT * FROM pmu_explain($$
   SELECT count(*) FROM big$$) AS line WHERE line ~ 'PMU:';
 RESET parallel_leader_participation;
 
--- spec: explain-pmu/In a worker
+-- case: In a worker
 SELECT pg_backend_pid() AS leader \gset
 CREATE FUNCTION explain_in_worker(leader int) RETURNS text
 LANGUAGE plpgsql PARALLEL SAFE AS $$
@@ -387,7 +387,7 @@ BEGIN
 END
 $$;
 
--- spec: explain-pmu/Inside a parallel plan
+-- case: Inside a parallel plan
 WITH q AS (SELECT pmu_json($$EXPLAIN (ANALYZE, PMU, FORMAT JSON)
                              SELECT count(*) FROM big$$) AS j),
      o AS (SELECT pmu_json($$EXPLAIN (ANALYZE, PMU, VERBOSE, FORMAT JSON)
@@ -490,7 +490,7 @@ $$;
 SELECT * FROM pmu_workers($$EXPLAIN (ANALYZE, PMU, VERBOSE, FORMAT JSON)
                             SELECT failing_query()$$);
 
--- spec: explain-pmu/A nested statement fails
+-- case: A nested statement fails
 CREATE FUNCTION failing_nested() RETURNS int
 LANGUAGE plpgsql AS $$
 BEGIN
@@ -505,7 +505,7 @@ $$;
 SELECT * FROM pmu_workers($$EXPLAIN (ANALYZE, PMU, VERBOSE, FORMAT JSON)
                             SELECT failing_nested()$$);
 
--- spec: explain-pmu/Two nested statements fail together
+-- case: Two nested statements fail together
 CREATE FUNCTION fail_inner() RETURNS int
 LANGUAGE plpgsql AS $$
 BEGIN
