@@ -17,10 +17,15 @@
 #include <errno.h>
 
 #include "commands/defrem.h"
+#include "commands/explain.h"
+#include "commands/explain_format.h"
 #include "commands/explain_state.h"
+#include "executor/executor.h"
 #include "fmgr.h"
 #include "miscadmin.h"
+#include "optimizer/planner.h"
 #include "storage/fd.h"
+#include "tcop/utility.h"
 #include "utils/guc.h"
 
 #include "pg_pmu_core.h"
@@ -35,13 +40,54 @@ extern void pmu_check_layout(void);
 extern void pmu_check_perf_abi(void);
 
 /*
+ * One start of the executor at the depth of a counting EXPLAIN: a
+ * candidate for the statement. Its counts are read when the executor
+ * starts and when it has finished; the end of the executor removes it.
+ */
+typedef struct PmuRecord
+{
+	struct PmuRecord *next;
+	QueryDesc  *query;			/* until its end */
+	PlannedStmt *plan;
+	PmuCounts	start;
+	PmuCounts	finish;
+	bool		finished;
+} PmuRecord;
+
+/*
+ * One EXPLAIN, from the start of its utility statement to its return or
+ * failure. Frames make a stack: an EXPLAIN that a function runs inside
+ * another one gets a frame above it.
+ */
+typedef struct PmuFrame
+{
+	struct PmuFrame *prev;
+	int			depth;			/* the depth of its EXPLAIN */
+	bool		counting;		/* the option PMU is on */
+	bool		referenced;		/* it holds a reference to the counters */
+	MemoryContext cxt;			/* where its records live */
+	PmuRecord  *records;		/* the newest first */
+} PmuFrame;
+
+/*
  * What the module keeps in the state of one EXPLAIN. It lives in the
  * memory of that EXPLAIN and dies with it.
  */
 typedef struct PmuExplainState
 {
 	bool		pmu;			/* the option PMU is on */
+	PmuFrame   *frame;			/* its frame, once it counts */
 } PmuExplainState;
+
+/* The top of the stack of frames. */
+static PmuFrame *pmu_frames = NULL;
+
+/*
+ * One more inside the planner and inside each start, run and finish of
+ * the executor; the statement of an EXPLAIN starts at the depth of its
+ * frame, the queries it runs inside deeper.
+ */
+static int	pmu_depth = 0;
 
 /* pg_pmu.max_nested: nested counting statements the server runs at once */
 static int	pmu_max_nested = 16;
@@ -53,6 +99,13 @@ static int	pmu_extension_id;
 static bool pmu_counters_opened = false;
 
 static explain_validate_options_hook_type prev_validate_options_hook = NULL;
+static explain_per_plan_hook_type prev_explain_per_plan_hook = NULL;
+static ProcessUtility_hook_type prev_ProcessUtility = NULL;
+static planner_hook_type prev_planner = NULL;
+static ExecutorStart_hook_type prev_ExecutorStart = NULL;
+static ExecutorRun_hook_type prev_ExecutorRun = NULL;
+static ExecutorFinish_hook_type prev_ExecutorFinish = NULL;
+static ExecutorEnd_hook_type prev_ExecutorEnd = NULL;
 
 pg_noreturn static void pmu_report(int32 status, int32 os_error);
 static void pmu_release_descriptors(uint32 n);
@@ -65,6 +118,29 @@ static bool pmu_option_guc_check(const char *option_name,
 								 NodeTag option_type);
 static void pmu_validate_options(ExplainState *es, List *options,
 								 ParseState *pstate);
+static void pmu_read(PmuCounts *now);
+static void pmu_frame_pop(PmuFrame *frame, bool report);
+static PmuRecord *pmu_find_record(QueryDesc *query);
+static void pmu_print(ExplainState *es, const char *phase,
+					  const PmuCounts *start, const PmuCounts *end);
+static void pmu_explain_per_plan(PlannedStmt *plannedstmt, IntoClause *into,
+								 ExplainState *es, const char *queryString,
+								 ParamListInfo params,
+								 QueryEnvironment *queryEnv);
+static void pmu_ProcessUtility(PlannedStmt *pstmt, const char *queryString,
+							   bool readOnlyTree,
+							   ProcessUtilityContext context,
+							   ParamListInfo params,
+							   QueryEnvironment *queryEnv,
+							   DestReceiver *dest, QueryCompletion *qc);
+static PlannedStmt *pmu_planner(Query *parse, const char *query_string,
+								int cursorOptions, ParamListInfo boundParams,
+								ExplainState *es);
+static void pmu_ExecutorStart(QueryDesc *queryDesc, int eflags);
+static void pmu_ExecutorRun(QueryDesc *queryDesc, ScanDirection direction,
+							uint64 count);
+static void pmu_ExecutorFinish(QueryDesc *queryDesc);
+static void pmu_ExecutorEnd(QueryDesc *queryDesc);
 
 void
 _PG_init(void)
@@ -105,6 +181,20 @@ _PG_init(void)
 
 	prev_validate_options_hook = explain_validate_options_hook;
 	explain_validate_options_hook = pmu_validate_options;
+	prev_explain_per_plan_hook = explain_per_plan_hook;
+	explain_per_plan_hook = pmu_explain_per_plan;
+	prev_ProcessUtility = ProcessUtility_hook;
+	ProcessUtility_hook = pmu_ProcessUtility;
+	prev_planner = planner_hook;
+	planner_hook = pmu_planner;
+	prev_ExecutorStart = ExecutorStart_hook;
+	ExecutorStart_hook = pmu_ExecutorStart;
+	prev_ExecutorRun = ExecutorRun_hook;
+	ExecutorRun_hook = pmu_ExecutorRun;
+	prev_ExecutorFinish = ExecutorFinish_hook;
+	ExecutorFinish_hook = pmu_ExecutorFinish;
+	prev_ExecutorEnd = ExecutorEnd_hook;
+	ExecutorEnd_hook = pmu_ExecutorEnd;
 }
 
 /*
@@ -171,10 +261,325 @@ pmu_validate_options(ExplainState *es, List *options, ParseState *pstate)
 				 errmsg("EXPLAIN option %s requires ANALYZE", "PMU")));
 
 	/*
+	 * The top frame is this EXPLAIN's, made by the hook of utility
+	 * statements at this depth; an EXPLAIN run in any other way cannot
+	 * count.
+	 */
+	if (pmu_frames == NULL || pmu_frames->depth != pmu_depth ||
+		pmu_frames->counting)
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("EXPLAIN option %s works only in an EXPLAIN statement",
+						"PMU")));
+
+	/*
 	 * Open the counters now, so that a system where this backend cannot
-	 * count fails the statement before it runs.
+	 * count fails the statement before it runs, and take the frame's
+	 * reference, which keeps them counting until the frame ends.
 	 */
 	pmu_open_counters();
+	{
+		PmuCounts	now;
+		int32		os_error = 0;
+		int32		status = pmu_counters_acquire(&now, &os_error);
+
+		if (status != PMU_OK)
+			pmu_report(status, os_error);
+	}
+	pmu_frames->referenced = true;
+	pmu_frames->counting = true;
+	state->frame = pmu_frames;
+}
+
+/*
+ * Read the counters, which a reference holds counting.
+ */
+static void
+pmu_read(PmuCounts *now)
+{
+	int32		os_error = 0;
+	int32		status = pmu_counters_read(now, &os_error);
+
+	if (status != PMU_OK)
+		pmu_report(status, os_error);
+}
+
+/*
+ * The hook of utility statements: a frame for each EXPLAIN, taken off
+ * the stack when it returns or fails.
+ */
+static void
+pmu_ProcessUtility(PlannedStmt *pstmt, const char *queryString,
+				   bool readOnlyTree, ProcessUtilityContext context,
+				   ParamListInfo params, QueryEnvironment *queryEnv,
+				   DestReceiver *dest, QueryCompletion *qc)
+{
+	PmuFrame   *frame = NULL;
+
+	if (IsA(pstmt->utilityStmt, ExplainStmt))
+	{
+		frame = palloc0_object(PmuFrame);
+		frame->prev = pmu_frames;
+		frame->depth = pmu_depth;
+		frame->cxt = CurrentMemoryContext;
+		pmu_frames = frame;
+	}
+
+	PG_TRY();
+	{
+		if (prev_ProcessUtility)
+			prev_ProcessUtility(pstmt, queryString, readOnlyTree, context,
+								params, queryEnv, dest, qc);
+		else
+			standard_ProcessUtility(pstmt, queryString, readOnlyTree,
+									context, params, queryEnv, dest, qc);
+	}
+	PG_CATCH();
+	{
+		if (frame != NULL)
+			pmu_frame_pop(frame, false);
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+
+	if (frame != NULL)
+		pmu_frame_pop(frame, true);
+}
+
+/*
+ * Take a frame off the stack and give back its reference. On the way
+ * out of an error nothing more is raised.
+ */
+static void
+pmu_frame_pop(PmuFrame *frame, bool report)
+{
+	Assert(pmu_frames == frame);
+	pmu_frames = frame->prev;
+	frame->records = NULL;
+
+	if (frame->referenced)
+	{
+		int32		os_error = 0;
+		int32		status = pmu_counters_release(&os_error);
+
+		frame->referenced = false;
+		if (status != PMU_OK && report)
+			pmu_report(status, os_error);
+	}
+}
+
+/*
+ * The record of an execution that has not ended, in any frame.
+ */
+static PmuRecord *
+pmu_find_record(QueryDesc *query)
+{
+	for (PmuFrame *f = pmu_frames; f != NULL; f = f->prev)
+		for (PmuRecord *r = f->records; r != NULL; r = r->next)
+			if (r->query == query)
+				return r;
+	return NULL;
+}
+
+static PlannedStmt *
+pmu_planner(Query *parse, const char *query_string, int cursorOptions,
+			ParamListInfo boundParams, ExplainState *es)
+{
+	PlannedStmt *result;
+
+	pmu_depth++;
+	PG_TRY();
+	{
+		if (prev_planner)
+			result = prev_planner(parse, query_string, cursorOptions,
+								  boundParams, es);
+		else
+			result = standard_planner(parse, query_string, cursorOptions,
+									  boundParams, es);
+	}
+	PG_FINALLY();
+	{
+		pmu_depth--;
+	}
+	PG_END_TRY();
+
+	return result;
+}
+
+/*
+ * A start of the executor at the depth of a counting frame is a
+ * candidate: read the counters and keep a record of it.
+ */
+static void
+pmu_ExecutorStart(QueryDesc *queryDesc, int eflags)
+{
+	PmuFrame   *frame = pmu_frames;
+
+	if (frame != NULL && frame->counting && pmu_depth == frame->depth)
+	{
+		PmuRecord  *record = MemoryContextAllocZero(frame->cxt,
+													sizeof(PmuRecord));
+
+		record->query = queryDesc;
+		record->plan = queryDesc->plannedstmt;
+		pmu_read(&record->start);
+		record->next = frame->records;
+		frame->records = record;
+	}
+
+	pmu_depth++;
+	PG_TRY();
+	{
+		if (prev_ExecutorStart)
+			prev_ExecutorStart(queryDesc, eflags);
+		else
+			standard_ExecutorStart(queryDesc, eflags);
+	}
+	PG_FINALLY();
+	{
+		pmu_depth--;
+	}
+	PG_END_TRY();
+}
+
+static void
+pmu_ExecutorRun(QueryDesc *queryDesc, ScanDirection direction, uint64 count)
+{
+	pmu_depth++;
+	PG_TRY();
+	{
+		if (prev_ExecutorRun)
+			prev_ExecutorRun(queryDesc, direction, count);
+		else
+			standard_ExecutorRun(queryDesc, direction, count);
+	}
+	PG_FINALLY();
+	{
+		pmu_depth--;
+	}
+	PG_END_TRY();
+}
+
+/*
+ * The finish of a candidate, AFTER triggers included, completes its
+ * record.
+ */
+static void
+pmu_ExecutorFinish(QueryDesc *queryDesc)
+{
+	PmuRecord  *record;
+
+	pmu_depth++;
+	PG_TRY();
+	{
+		if (prev_ExecutorFinish)
+			prev_ExecutorFinish(queryDesc);
+		else
+			standard_ExecutorFinish(queryDesc);
+	}
+	PG_FINALLY();
+	{
+		pmu_depth--;
+	}
+	PG_END_TRY();
+
+	record = pmu_find_record(queryDesc);
+	if (record != NULL && !record->finished)
+	{
+		pmu_read(&record->finish);
+		record->finished = true;
+	}
+}
+
+/*
+ * The end of an execution removes its record: what runs while a plan is
+ * printed has ended by the time the printing hook looks, and so has
+ * what computed the parameters of EXPLAIN EXECUTE.
+ */
+static void
+pmu_ExecutorEnd(QueryDesc *queryDesc)
+{
+	for (PmuFrame *f = pmu_frames; f != NULL; f = f->prev)
+		for (PmuRecord **r = &f->records; *r != NULL; r = &(*r)->next)
+			if ((*r)->query == queryDesc)
+			{
+				*r = (*r)->next;
+				break;
+			}
+
+	if (prev_ExecutorEnd)
+		prev_ExecutorEnd(queryDesc);
+	else
+		standard_ExecutorEnd(queryDesc);
+}
+
+/*
+ * Print two counts: in text one line, in the other formats integer
+ * properties named "<phase> Instructions" and "<phase> Cycles".
+ */
+static void
+pmu_print(ExplainState *es, const char *phase, const PmuCounts *start,
+		  const PmuCounts *end)
+{
+	uint64		instructions = end->instructions - start->instructions;
+	uint64		cycles = end->cycles - start->cycles;
+
+	if (es->format == EXPLAIN_FORMAT_TEXT)
+	{
+		ExplainIndentText(es);
+		appendStringInfo(es->str,
+						 "%s PMU: instructions=" UINT64_FORMAT
+						 " cycles=" UINT64_FORMAT "\n",
+						 phase, instructions, cycles);
+	}
+	else
+	{
+		char		label[64];
+
+		snprintf(label, sizeof(label), "%s Instructions", phase);
+		ExplainPropertyUInteger(label, NULL, instructions, es);
+		snprintf(label, sizeof(label), "%s Cycles", phase);
+		ExplainPropertyUInteger(label, NULL, cycles, es);
+	}
+}
+
+/*
+ * The hook that runs for each plan after EXPLAIN ANALYZE has run and
+ * printed it, before the executor ends: print the counts of the record of
+ * this plan whose execution has not ended, then forget the frame's
+ * records. It does nothing for an EXPLAIN without the option, and for the
+ * plans auto_explain logs.
+ */
+static void
+pmu_explain_per_plan(PlannedStmt *plannedstmt, IntoClause *into,
+					 ExplainState *es, const char *queryString,
+					 ParamListInfo params, QueryEnvironment *queryEnv)
+{
+	PmuExplainState *state;
+	PmuRecord  *record = NULL;
+
+	if (prev_explain_per_plan_hook)
+		prev_explain_per_plan_hook(plannedstmt, into, es, queryString,
+								   params, queryEnv);
+
+	state = GetExplainExtensionState(es, pmu_extension_id);
+	if (state == NULL || !state->pmu)
+		return;
+
+	if (state->frame != NULL)
+		for (PmuRecord *r = state->frame->records; r != NULL; r = r->next)
+			if (r->plan == plannedstmt && r->finished)
+			{
+				record = r;
+				break;
+			}
+	if (record == NULL)
+		ereport(ERROR,
+				(errcode(ERRCODE_INTERNAL_ERROR),
+				 errmsg("pg_pmu found no counts of the plan it prints")));
+
+	pmu_print(es, "Execution", &record->start, &record->finish);
+	state->frame->records = NULL;
 }
 
 /*

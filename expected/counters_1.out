@@ -2,7 +2,8 @@
 -- second expected output, counters_1.out, where each counting EXPLAIN
 -- prints "cannot count".
 -- Run an EXPLAIN and return its lines, with the numbers of the lines of
--- pg_pmu replaced by N, as they change from run to run; or one line
+-- pg_pmu and of times replaced by N, as they change from run to run, in
+-- every format; or one line
 -- when the system cannot count, whichever of its three codes it fails
 -- with. The codes are matched exactly: a condition name would take in
 -- its whole class, such as disk_full beside insufficient_resources.
@@ -12,10 +13,14 @@ DECLARE
   line text;
 BEGIN
   FOR line IN EXECUTE query LOOP
-    IF line ~ 'PMU:' THEN
-      line := regexp_replace(line, '[0-9]+', 'N', 'g');
-    END IF;
-    RETURN NEXT line;
+    -- A document in JSON, YAML or XML comes as one row of many lines.
+    RETURN NEXT (
+      SELECT string_agg(
+               CASE WHEN l ~ '(PMU|Instructions|Cycles|Time)'
+                    THEN regexp_replace(l, '[0-9]+([.][0-9]+)?', 'N', 'g')
+                    ELSE l END,
+               E'\n' ORDER BY n)
+      FROM regexp_split_to_table(line, E'\n') WITH ORDINALITY AS x(l, n));
   END LOOP;
 EXCEPTION
   WHEN SQLSTATE '42501' OR SQLSTATE '0A000' OR SQLSTATE '53000' THEN
@@ -38,5 +43,191 @@ SELECT is_called FROM s;
  is_called 
 -----------
  f
+(1 row)
+
+-- The query of an EXPLAIN in JSON, or NULL when the system cannot
+-- count, to compare counts.
+CREATE FUNCTION pmu_json(query text) RETURNS jsonb
+LANGUAGE plpgsql AS $$
+DECLARE
+  doc text;
+BEGIN
+  EXECUTE query INTO doc;
+  RETURN doc::jsonb -> 0;
+EXCEPTION
+  WHEN SQLSTATE '42501' OR SQLSTATE '0A000' OR SQLSTATE '53000' THEN
+    RETURN NULL;
+END
+$$;
+-- Plans without parallel workers or JIT, so that a count is the work of
+-- one process on the same plan.
+SET max_parallel_workers_per_gather = 0;
+SET jit = off;
+CREATE TABLE small AS SELECT g FROM generate_series(1, 1000) g;
+CREATE TABLE big AS SELECT g FROM generate_series(1, 100000) g;
+ANALYZE small, big;
+-- spec: explain-pmu/Loaded at the start
+-- spec: explain-pmu/With ANALYZE
+-- spec: explain-pmu/Text
+SELECT * FROM pmu_explain($$
+  EXPLAIN (ANALYZE, PMU, COSTS off, TIMING off, BUFFERS off) SELECT 1$$);
+ pmu_explain  
+--------------
+ cannot count
+(1 row)
+
+-- The counts come before "Execution Time" also with SUMMARY off.
+SELECT * FROM pmu_explain($$
+  EXPLAIN (ANALYZE, PMU, COSTS off, TIMING off, SUMMARY off, BUFFERS off)
+  SELECT 1$$);
+ pmu_explain  
+--------------
+ cannot count
+(1 row)
+
+-- spec: explain-pmu/JSON and YAML
+SELECT * FROM pmu_explain($$
+  EXPLAIN (ANALYZE, PMU, COSTS off, TIMING off, SUMMARY off, BUFFERS off,
+           FORMAT JSON) SELECT 1$$);
+ pmu_explain  
+--------------
+ cannot count
+(1 row)
+
+SELECT * FROM pmu_explain($$
+  EXPLAIN (ANALYZE, PMU, COSTS off, TIMING off, SUMMARY off, BUFFERS off,
+           FORMAT YAML) SELECT 1$$);
+ pmu_explain  
+--------------
+ cannot count
+(1 row)
+
+SELECT k, (j ->> k)::numeric > 0 AS positive
+FROM pmu_json($$EXPLAIN (ANALYZE, PMU, FORMAT JSON) SELECT 1$$) j,
+     unnest(ARRAY['Execution Instructions', 'Execution Cycles']) k;
+           k            | positive 
+------------------------+----------
+ Execution Instructions | 
+ Execution Cycles       | 
+(2 rows)
+
+-- spec: explain-pmu/XML
+SELECT * FROM pmu_explain($$
+  EXPLAIN (ANALYZE, PMU, COSTS off, TIMING off, SUMMARY off, BUFFERS off,
+           FORMAT XML) SELECT 1$$);
+ pmu_explain  
+--------------
+ cannot count
+(1 row)
+
+-- spec: explain-pmu/More rows, more work
+WITH s AS (SELECT pmu_json($$EXPLAIN (ANALYZE, PMU, FORMAT JSON)
+                             SELECT count(*) FROM small$$) j),
+     b AS (SELECT pmu_json($$EXPLAIN (ANALYZE, PMU, FORMAT JSON)
+                             SELECT count(*) FROM big$$) j)
+SELECT k, (b.j ->> k)::numeric > (s.j ->> k)::numeric AS larger
+FROM s, b, unnest(ARRAY['Execution Instructions', 'Execution Cycles']) k;
+           k            | larger 
+------------------------+--------
+ Execution Instructions | 
+ Execution Cycles       | 
+(2 rows)
+
+-- spec: explain-pmu/Work of a function
+CREATE FUNCTION count_big() RETURNS bigint
+LANGUAGE plpgsql AS $$
+BEGIN
+  RETURN (SELECT count(*) FROM big);
+END
+$$;
+WITH f AS (SELECT pmu_json($$EXPLAIN (ANALYZE, PMU, FORMAT JSON)
+                             SELECT count_big()$$) j),
+     q AS (SELECT pmu_json($$EXPLAIN (ANALYZE, PMU, FORMAT JSON)
+                             SELECT count(*) FROM big$$) j)
+SELECT (f.j ->> 'Execution Instructions')::numeric
+       > (q.j ->> 'Execution Instructions')::numeric / 2 AS includes_its_query
+FROM f, q;
+ includes_its_query 
+--------------------
+ 
+(1 row)
+
+-- spec: explain-pmu/A rule makes two plans
+CREATE TABLE ruled (a int);
+CREATE TABLE copied (a int);
+CREATE RULE copy AS ON INSERT TO ruled DO ALSO INSERT INTO copied VALUES (new.a);
+SELECT * FROM pmu_explain($$
+  EXPLAIN (ANALYZE, PMU, COSTS off, TIMING off, SUMMARY off, BUFFERS off)
+  INSERT INTO ruled VALUES (1)$$);
+ pmu_explain  
+--------------
+ cannot count
+(1 row)
+
+-- spec: explain-pmu/No plan
+CREATE TABLE nothing (a int);
+CREATE RULE none AS ON INSERT TO nothing DO INSTEAD NOTHING;
+SELECT * FROM pmu_explain($$
+  EXPLAIN (ANALYZE, PMU, COSTS off, TIMING off, SUMMARY off, BUFFERS off)
+  INSERT INTO nothing VALUES (1)$$);
+ pmu_explain  
+--------------
+ cannot count
+(1 row)
+
+-- An EXPLAIN followed by other statements in one call of SPI: its frame
+-- ends with it, and what follows is not taken for it.
+DO $$
+BEGIN
+  EXECUTE 'EXPLAIN (ANALYZE, PMU) SELECT 1; SELECT count(*) FROM small';
+EXCEPTION
+  WHEN SQLSTATE '42501' OR SQLSTATE '0A000' OR SQLSTATE '53000' THEN
+    RAISE NOTICE 'cannot count';
+END
+$$;
+NOTICE:  cannot count
+-- A parameter of EXPLAIN EXECUTE that opens a cursor: the cursor's
+-- executor does not finish inside the EXPLAIN, and is not taken for it.
+CREATE FUNCTION open_cursor() RETURNS refcursor
+LANGUAGE plpgsql AS $$
+DECLARE
+  c refcursor;
+BEGIN
+  OPEN c FOR SELECT g FROM small;
+  RETURN c;
+END
+$$;
+PREPARE with_cursor(refcursor) AS SELECT $1;
+BEGIN;
+SELECT * FROM pmu_explain($$
+  EXPLAIN (ANALYZE, PMU, COSTS off, TIMING off, SUMMARY off, BUFFERS off)
+  EXECUTE with_cursor(open_cursor())$$);
+ pmu_explain  
+--------------
+ cannot count
+(1 row)
+
+COMMIT;
+-- An EXPLAIN that fails inside an EXCEPTION block, and one that counts
+-- after it.
+DO $$
+BEGIN
+  BEGIN
+    EXECUTE 'EXPLAIN (ANALYZE, PMU) SELECT 1 / 0';
+  EXCEPTION WHEN division_by_zero THEN
+    RAISE NOTICE 'the EXPLAIN failed';
+  END;
+EXCEPTION
+  WHEN SQLSTATE '42501' OR SQLSTATE '0A000' OR SQLSTATE '53000' THEN
+    RAISE NOTICE 'cannot count';
+END
+$$;
+NOTICE:  cannot count
+SELECT * FROM pmu_explain($$
+  EXPLAIN (ANALYZE, PMU, COSTS off, TIMING off, SUMMARY off, BUFFERS off)
+  SELECT 1$$);
+ pmu_explain  
+--------------
+ cannot count
 (1 row)
 
