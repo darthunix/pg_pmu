@@ -72,7 +72,7 @@ pub struct PmuLayout {
 ///
 /// `out` is the address of a `PmuLayout`, or null, which does nothing.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn pmu_core_layout(out: *mut PmuLayout) {
+pub unsafe extern "C" fn pmu_counters_layout(out: *mut PmuLayout) {
     if out.is_null() {
         return;
     }
@@ -116,7 +116,7 @@ pub struct PmuPerfAbi {
 ///
 /// `out` is the address of a `PmuPerfAbi`, or null, which does nothing.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn pmu_core_perf_abi(out: *mut PmuPerfAbi) {
+pub unsafe extern "C" fn pmu_counters_perf_abi(out: *mut PmuPerfAbi) {
     use crate::counters::perf_abi as abi;
     if out.is_null() {
         return;

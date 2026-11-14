@@ -32,7 +32,7 @@ pmu_check_layout(void)
 {
 	PmuLayout	layout = {0};
 
-	pmu_core_layout(&layout);
+	pmu_counters_layout(&layout);
 	if (layout.counts_size != sizeof(PmuCounts) ||
 		layout.counts_cycles != offsetof(PmuCounts, cycles) ||
 		layout.perf_abi_size != sizeof(PmuPerfAbi) ||
@@ -101,7 +101,7 @@ pmu_check_perf_abi(void)
 #ifdef __linux__
 	PmuPerfAbi	abi = {0};
 
-	pmu_core_perf_abi(&abi);
+	pmu_counters_perf_abi(&abi);
 	PMU_CHECK(abi.attr_size, PERF_ATTR_SIZE_VER0);
 	PMU_CHECK(abi.config_offset, offsetof(struct perf_event_attr, config));
 	PMU_CHECK(abi.read_format_offset, offsetof(struct perf_event_attr, read_format));
