@@ -1,4 +1,4 @@
-# The observations of the README on the runners of Linux, which count:
+# The observations of doc/observations.md on the runners of Linux:
 # PostgreSQL master without assertions, Tessera's release build, and
 # the statements of .github/scripts/observe.sh. It runs when its files
 # change, or by hand. A runner is a virtual machine shared with others,
@@ -25,7 +25,7 @@ jobs:
     runs-on: ${{ matrix.os }}
     env:
       LANG: C.UTF-8
-      # The revision of Tessera the README's observations name.
+      # The revision of Tessera that doc/observations.md names.
       TESSERA: 2cea4ceaaa07b9f0efe746bffd07a5c731e83452
     steps:
       - uses: actions/checkout@v4

@@ -1,5 +1,5 @@
 #!/bin/sh
-# The observations of the README: ten runs of each statement in one
+# The observations of doc/observations.md: ten runs of each statement in one
 # session after a run that fills the caches, against the server psql
 # reaches by its environment, with Tessera and pg_pmu loaded and a
 # table t of 100000 rows; then the smallest count of each and how much

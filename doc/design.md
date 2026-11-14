@@ -12,28 +12,14 @@ EXPLAIN (ANALYZE, PMU, VERBOSE) SELECT count(*) FROM t;
  Workers PMU: instructions=7248083 cycles=1922555
 ```
 
-The main use is to compare two ways of running the same query, for
-example PostgreSQL's executor against a batch executor such as
-Tessera. In our measurements, once the caches were warm, instructions
-repeated almost exactly from run to run, while time and cycles varied
-much more (see the README).
+The main use is to compare two ways of running the same query: two
+plans, two settings, two executors. Once the caches are warm,
+instructions repeat almost exactly from run to run, while time and
+cycles vary much more (see [observations.md](observations.md)). The
+goals and limitations are in the [README](../README.md).
 
 This note explains how the module finds the statement, how it counts,
 how parallel workers report, and how all of it is tested.
-
-## Goals
-
-- Counts for one statement, workers included, in EXPLAIN's output.
-- Constant overhead: a few reads of the counters per statement and
-  process, independent of the number of rows. Without the option no
-  counter is read; the hooks only keep a little bookkeeping for each
-  EXPLAIN.
-- No objects in the database and a fixed amount of shared memory.
-- A count is either right or an error. Never a plausible wrong number.
-
-Not goals: counts per plan node (the counting would cost more than
-many nodes), statistics over many statements (that is
-pg_stat_kcache's job), systems other than Linux and macOS.
 
 ## The big picture
 
@@ -363,13 +349,23 @@ and that tokens and their decimal form round-trip, and bounded proofs
 that the parsers of sysfs and of a counter read never panic (inputs of
 a few bytes; longer ones are left to proptest).
 
+Makefile targets for the special cases: `installcheck-counted` fails
+if a suite matched the "cannot count" output, and with
+`PG_PMU_REQUIRE_COUNTERS=1` the crate's tests fail where they cannot
+count; `installcheck-paranoid` and `installcheck-vm` run the suites of
+those systems; on a machine that counts, `make` and `make install`
+with `PG_PMU_TEST=workers-cannot-count`, then
+`installcheck-workers-cannot-count`, run the failing-worker suite
+(build and install again without `PG_PMU_TEST` afterwards);
+`PG_PMU_COUNTERS=none` builds a module that cannot count.
+
 **CI** builds PostgreSQL 19 and master on Linux x86-64, Linux AArch64
 and macOS. Where the kernel shows a hardware PMU (always on AArch64,
 on some x86-64 hosts) CI demands real counts and also runs the
 paranoid and failing-worker suites. macOS runners are virtual
 machines and run the VM suite. Every job also runs the suites of a
 build without counters (`PG_PMU_COUNTERS=none`). A separate workflow
-runs the README's observations on Linux.
+runs the observations of [observations.md](observations.md) on Linux.
 
 ## Files
 
@@ -386,5 +382,7 @@ runs the README's observations on Linux.
    src/ffi.rs      the functions C calls
    tests/          proptest models, loom models, real counters
  sql/, expected/   regression suites
+ README.md         goals, limitations, use, build
+ doc/observations.md  how stable the counts are, measured
  .github/          CI, observations, PostgreSQL build
 ```
