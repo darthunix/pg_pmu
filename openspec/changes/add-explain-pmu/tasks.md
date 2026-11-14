@@ -142,7 +142,7 @@ with the lints of the design, and the commands each task names.
 
 ## 6. CI
 
-- [ ] 6.1 Add `.github/workflows/ci.yml`: build PostgreSQL 19 and
+- [x] 6.1 Add `.github/workflows/ci.yml`: build PostgreSQL 19 and
   master at fixed revisions, with assertions and with auto_explain
   from contrib, on Ubuntu and on macOS on Apple silicon; on Ubuntu set
   `kernel.perf_event_paranoid` to 2 with `sudo sysctl`; run the suite;

@@ -1,12 +1,13 @@
 # Builds and tests of pg_pmu: the suites on PostgreSQL 19 and master,
 # at the revisions of postgres.env, on Linux on x86-64 and on AArch64
 # and on macOS on Apple silicon; the checks of the crate; its models of
-# loom; its proofs of Kani. Of the runners only the one of AArch64
-# Linux counts: there the suites must match their first expected
-# outputs, and the suites of a kernel that refuses and of workers that
-# cannot count run too. The x86-64 runner has no PMU and the macOS one
-# is a virtual machine; they pass the suites with their second expected
-# outputs, and the step "Expected outputs" says which matched.
+# loom; its proofs of Kani. The runners of AArch64 Linux count: there
+# the suites must match their first expected outputs, and the suites of
+# a kernel that refuses and of workers that cannot count run too. The
+# x86-64 runners counted in the first run as well, with a virtual PMU,
+# but the job does not demand it there; the macOS runners are virtual
+# machines that report no instructions and match the second expected
+# outputs. The step "Expected outputs" says which output matched.
 name: CI
 
 on:
