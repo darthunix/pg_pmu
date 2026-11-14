@@ -232,7 +232,7 @@ pub fn discover(fs: &dyn Fs, uniform: Option<bool>) -> Result<Plan, Status> {
         covered.union(&cpus);
     });
     if units > MAX_KINDS {
-        return Err(Status::KindNotOpenable);
+        return Err(Status::TooManyKinds);
     }
     if listed.is_err() || units == 0 {
         // No unit names its processors: one kind of cores, if the
@@ -339,10 +339,11 @@ mod proofs {
         let buf: [u8; 12] = kani::any();
         let len: usize = kani::any();
         kani::assume(len <= buf.len());
-        if let Ok(n) = parse_u32(&buf[..len]) {
-            assert!(len > 0);
-            assert!(buf[..len].iter().all(|b| b.is_ascii_digit()));
-            let _ = n;
+        let digits = len > 0 && buf[..len].iter().all(|b| b.is_ascii_digit());
+        match parse_u32(&buf[..len]) {
+            Ok(_) => assert!(digits),
+            // Nine digits always fit in 32 bits.
+            Err(_) => assert!(!digits || len > 9),
         }
     }
 

@@ -69,6 +69,9 @@ pub fn parse_group_read(buf: &[u8]) -> Option<(u64, u64)> {
 pub fn open_error(errno: i32, typed: bool) -> Error {
     let status = match errno {
         libc::EACCES | libc::EPERM => Status::NotPermitted,
+        // ENOSYS: no perf events at all, as under gVisor or some filters
+        // of system calls.
+        libc::ENOSYS => Status::NoCounters,
         libc::ENOENT | libc::EOPNOTSUPP | libc::ENODEV if typed => Status::KindNotOpenable,
         libc::ENOENT | libc::EOPNOTSUPP | libc::ENODEV => Status::NoCounters,
         libc::EINVAL if typed => Status::KindNotOpenable,
@@ -222,11 +225,19 @@ impl<S: PerfSys> Backend for Perf<S> {
             }
         }
         // Check that the groups count: a group that finds no free
-        // counter is in the error state and reads no bytes.
+        // counter is in the error state and reads no bytes, and a group
+        // that the hypervisor opens but never counts reads zero.
         let check = self
             .each_leader(PERF_EVENT_IOC_ENABLE)
             .and_then(|()| self.read_groups(Status::NoFreeCounter))
-            .and_then(|_| self.each_leader(PERF_EVENT_IOC_DISABLE));
+            .and_then(|counts| {
+                if counts.instructions == 0 {
+                    Err(Error::new(Status::NoCounters))
+                } else {
+                    Ok(())
+                }
+            })
+            .and_then(|()| self.each_leader(PERF_EVENT_IOC_DISABLE));
         if let Err(e) = check {
             let _ = self.each_leader(PERF_EVENT_IOC_DISABLE);
             self.close_all();
@@ -236,7 +247,10 @@ impl<S: PerfSys> Backend for Perf<S> {
     }
 
     fn enable(&mut self) -> Result<(), Error> {
-        self.each_leader(PERF_EVENT_IOC_ENABLE)
+        // A failure midway leaves no group on.
+        self.each_leader(PERF_EVENT_IOC_ENABLE).inspect_err(|_| {
+            let _ = self.each_leader(PERF_EVENT_IOC_DISABLE);
+        })
     }
 
     fn disable(&mut self) -> Result<(), Error> {
@@ -261,12 +275,14 @@ mod proofs {
         let len: usize = kani::any();
         kani::assume(len <= 64);
         let part = &buf[..len];
-        let accepted = parse_group_read(part).is_some();
-        let nr = if len >= 8 {
-            u64::from_ne_bytes(buf[..8].try_into().unwrap())
-        } else {
-            0
-        };
-        assert_eq!(accepted, len == READ_LEN && nr == 2);
+        let word = |i: usize| u64::from_ne_bytes(buf[i * 8..i * 8 + 8].try_into().unwrap());
+        let nr = if len >= 8 { word(0) } else { 0 };
+        match parse_group_read(part) {
+            Some((instructions, cycles)) => {
+                assert!(len == READ_LEN && nr == 2);
+                assert_eq!((instructions, cycles), (word(1), word(2)));
+            }
+            None => assert!(len != READ_LEN || nr != 2),
+        }
     }
 }

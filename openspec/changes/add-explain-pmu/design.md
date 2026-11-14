@@ -443,7 +443,7 @@ processors. The rule:
 - more than one such unit: one group for each, with the type of the
   unit in bits 32 to 63 of the event's configuration, as the kernel
   takes it for hardware events since Linux 5.13 on Intel; the counts
-  of the groups are added;
+  of the groups are added; more than four units fail with 0A000;
 - one unit, or none, as on x86 with one kind of cores, where the unit
   has no file `cpus`: one group without a type;
 - the processors of the units must cover the processors online when
@@ -696,6 +696,12 @@ system calls for that are few, and `libc` has the call itself.
   an internal error rather than show wrong numbers.
 - [The counts include the instrumentation of EXPLAIN ANALYZE.] → The
   spec and the README say so, and recommend `TIMING off`.
+- [On a processor with two kinds of cores, the group of one kind is
+  pinned while the thread runs on the other kind. The design assumes
+  the kernel skips it there, as perf's filter of units does, rather
+  than put it into the error state, which would fail every statement
+  with 53000.] → Checked first on an Intel machine with two kinds of
+  cores.
 - [A fault in the bookkeeping of held cells would leave cells of the
   pool taken until a restart.] → The tests return a cell after a
   failed nested statement and take it again.

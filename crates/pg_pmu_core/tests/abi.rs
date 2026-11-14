@@ -10,7 +10,7 @@
 
 use pg_pmu_core::Status;
 
-const ALL: [Status; 11] = [
+const ALL: [Status; 12] = [
     Status::Ok,
     Status::NotPermitted,
     Status::NoSystem,
@@ -22,6 +22,7 @@ const ALL: [Status; 11] = [
     Status::CounterLost,
     Status::SystemError,
     Status::Internal,
+    Status::TooManyKinds,
 ];
 
 /// The C name of each code, as the header spells it.
@@ -38,6 +39,7 @@ fn c_name(status: Status) -> &'static str {
         Status::CounterLost => "PMU_COUNTER_LOST",
         Status::SystemError => "PMU_SYSTEM_ERROR",
         Status::Internal => "PMU_INTERNAL",
+        Status::TooManyKinds => "PMU_TOO_MANY_KINDS",
     }
 }
 

@@ -165,8 +165,16 @@ const DEVICES: &[u8] = b"bus/event_source/devices";
 
 fn sysfs_of(m: &Machine) -> MemFs {
     let mut fs = MemFs::default();
-    // Units that are not kinds of cores, which have no file cpus.
+    // Units that are not kinds of cores: with no file cpus, or one that
+    // does not read as a list, beside a type.
     let mut names: Vec<Vec<u8>> = vec![b"software".to_vec(), b"tracepoint".to_vec()];
+    for (name, cpus) in [(&b"broken"[..], &b"0-x\n"[..]), (b"reversed", b"5-2\n")] {
+        fs.files
+            .insert([DEVICES, b"/", name, b"/cpus"].concat(), cpus.to_vec());
+        fs.files
+            .insert([DEVICES, b"/", name, b"/type"].concat(), b"99\n".to_vec());
+        names.push(name.to_vec());
+    }
     for (k, unit) in m.units.iter().enumerate() {
         let name = format!("cpu_kind{k}").into_bytes();
         let path = |file: &str| [DEVICES, b"/", &name, b"/", file.as_bytes()].concat();
@@ -197,7 +205,7 @@ fn model(m: &Machine) -> Result<Plan, Status> {
         Vec::new()
     };
     if units.len() > MAX_KINDS {
-        return Err(Status::KindNotOpenable);
+        return Err(Status::TooManyKinds);
     }
     let mut plan = Plan {
         typed: false,
@@ -335,14 +343,18 @@ proptest! {
         let mut c = Counters::new(Fake::default());
         c.open().unwrap();
         let mut refs = 0u32;
+        // The fake counts one at each read while it is enabled.
+        let mut value = 0u64;
         for op in ops {
             match op {
                 Op::Acquire { fail } => {
                     c_fail(&mut c, fail);
                     let r = c.acquire();
                     prop_assert_eq!(r.is_ok(), !fail);
-                    if r.is_ok() {
+                    if let Ok(counts) = r {
                         refs += 1;
+                        value += 1;
+                        prop_assert_eq!(counts.instructions, value);
                     }
                 }
                 Op::Read { fail } => {
@@ -353,6 +365,10 @@ proptest! {
                         clear_fail(&mut c);
                     } else {
                         prop_assert_eq!(r.is_ok(), !fail);
+                        if let Ok(counts) = r {
+                            value += 1;
+                            prop_assert_eq!(counts.instructions, value);
+                        }
                     }
                 }
                 Op::Release => {
@@ -396,7 +412,14 @@ struct FakeSys {
     opens: usize,
     /// Reads of an enabled leader give no bytes: no free counter.
     error_state: bool,
-    flags_seen: Vec<u64>,
+    /// Each open: its attributes and the group it joins.
+    opened: Vec<(PerfEventAttr, i32)>,
+    /// Each ioctl: its descriptor, request and argument.
+    ioctls: Vec<(i32, u64, u64)>,
+    /// What reads of instructions give, or the descriptor if None.
+    instructions: Option<u64>,
+    /// Fail an enable of this leader.
+    fail_enable_of: Option<i32>,
 }
 
 impl PerfSys for FakeSys {
@@ -409,7 +432,7 @@ impl PerfSys for FakeSys {
             return Err(e);
         }
         assert!(group_fd == -1 || self.leaders.contains(&group_fd));
-        self.flags_seen.push(attr.flags);
+        self.opened.push((*attr, group_fd));
         self.next_fd += 1;
         let fd = self.next_fd + 100;
         self.open.insert(fd);
@@ -419,10 +442,14 @@ impl PerfSys for FakeSys {
         Ok(fd)
     }
 
-    fn ioctl(&mut self, fd: i32, request: u64, _: u64) -> Result<(), i32> {
+    fn ioctl(&mut self, fd: i32, request: u64, arg: u64) -> Result<(), i32> {
         assert!(self.leaders.contains(&fd));
+        self.ioctls.push((fd, request, arg));
         match request {
             PERF_EVENT_IOC_ENABLE => {
+                if self.fail_enable_of == Some(fd) {
+                    return Err(libc::EIO);
+                }
                 self.enabled.insert(fd);
             }
             PERF_EVENT_IOC_DISABLE => {
@@ -438,7 +465,8 @@ impl PerfSys for FakeSys {
         if self.error_state && self.enabled.contains(&fd) {
             return Ok(0);
         }
-        let words = [2u64, 1000 + fd as u64, 2000 + fd as u64];
+        let instructions = self.instructions.unwrap_or(1000 + fd as u64);
+        let words = [2u64, instructions, 2000 + fd as u64];
         for (i, w) in words.iter().enumerate() {
             buf[i * 8..i * 8 + 8].copy_from_slice(&w.to_ne_bytes());
         }
@@ -509,14 +537,97 @@ fn a_next_opening_succeeds_after_a_failure() {
 }
 
 #[test]
-fn leaders_are_pinned_and_members_follow() {
+fn leaders_count_instructions_and_members_cycles_of_their_kind() {
+    use pg_pmu_core::counters::perf_abi::{
+        PERF_COUNT_HW_CPU_CYCLES, PERF_COUNT_HW_INSTRUCTIONS, PERF_FORMAT_GROUP,
+        PERF_IOC_FLAG_GROUP, PERF_TYPE_HARDWARE,
+    };
+    for typed in [false, true] {
+        let count = if typed { 2 } else { 1 };
+        let mut perf = Perf::with(FakeSys::default());
+        perf.set_plan(plan_of(count, typed));
+        perf.open().unwrap();
+        let opened = &perf.sys().opened;
+        assert_eq!(opened.len(), 2 * count);
+        for (g, pair) in opened.chunks(2).enumerate() {
+            let unit = if typed { (8 + g as u64) << 32 } else { 0 };
+            let (leader, member) = (&pair[0], &pair[1]);
+            assert_eq!(leader.0.config, PERF_COUNT_HW_INSTRUCTIONS | unit);
+            assert_eq!(member.0.config, PERF_COUNT_HW_CPU_CYCLES | unit);
+            assert_eq!(leader.0.flags, LEADER_FLAGS);
+            assert_eq!(member.0.flags, MEMBER_FLAGS);
+            for (attr, _) in pair {
+                assert_eq!(attr.type_, PERF_TYPE_HARDWARE);
+                assert_eq!(attr.read_format, PERF_FORMAT_GROUP);
+                assert_eq!(attr.size, 64);
+            }
+            // The leader opens alone; the member joins its group.
+            assert_eq!(leader.1, -1);
+            assert_eq!(member.1, 100 + 1 + 2 * g as i32);
+        }
+        // Every enable and disable applies to the whole group.
+        assert!(!perf.sys().ioctls.is_empty());
+        assert!(
+            perf.sys()
+                .ioctls
+                .iter()
+                .all(|&(_, _, arg)| arg == PERF_IOC_FLAG_GROUP)
+        );
+    }
+}
+
+#[test]
+fn a_group_that_counts_nothing_is_refused() {
+    let mut perf = Perf::with(FakeSys {
+        instructions: Some(0),
+        ..FakeSys::default()
+    });
+    perf.set_plan(plan_of(1, false));
+    assert_eq!(perf.open().unwrap_err().status, Status::NoCounters);
+    assert!(perf.sys().open.is_empty());
+}
+
+#[test]
+fn a_failed_enable_leaves_no_group_on() {
     let mut perf = Perf::with(FakeSys::default());
     perf.set_plan(plan_of(2, true));
     perf.open().unwrap();
-    assert_eq!(
-        perf.sys().flags_seen,
-        [LEADER_FLAGS, MEMBER_FLAGS, LEADER_FLAGS, MEMBER_FLAGS]
-    );
+    perf.sys_mut().fail_enable_of = Some(103);
+    assert!(perf.enable().is_err());
+    assert!(perf.sys().enabled.is_empty());
+}
+
+#[test]
+fn errors_of_opening_mean_what_the_spec_says() {
+    let table = [
+        (libc::EACCES, false, Status::NotPermitted),
+        (libc::EPERM, true, Status::NotPermitted),
+        (libc::ENOSYS, false, Status::NoCounters),
+        (libc::ENOENT, false, Status::NoCounters),
+        (libc::ENOENT, true, Status::KindNotOpenable),
+        (libc::EOPNOTSUPP, false, Status::NoCounters),
+        (libc::EINVAL, true, Status::KindNotOpenable),
+        (libc::EINVAL, false, Status::SystemError),
+        (libc::EMFILE, false, Status::NoDescriptor),
+        (libc::ENFILE, true, Status::NoDescriptor),
+        (libc::EBUSY, false, Status::NoFreeCounter),
+        (libc::EIO, false, Status::SystemError),
+    ];
+    for (errno, typed, status) in table {
+        let e = open_error(errno, typed);
+        assert_eq!((e.status, e.os_error), (status, errno), "{errno} {typed}");
+    }
+}
+
+#[test]
+fn reads_of_a_group_are_checked() {
+    use pg_pmu_core::counters::perf::parse_group_read;
+    let words = |w: &[u64]| w.iter().flat_map(|x| x.to_ne_bytes()).collect::<Vec<u8>>();
+    assert_eq!(parse_group_read(&words(&[2, 7, 9])), Some((7, 9)));
+    assert_eq!(parse_group_read(&words(&[1, 7, 9])), None);
+    assert_eq!(parse_group_read(&words(&[2, 7])), None);
+    assert_eq!(parse_group_read(&words(&[2, 7, 9, 0])), None);
+    assert_eq!(parse_group_read(&[]), None);
 }
 
 #[test]

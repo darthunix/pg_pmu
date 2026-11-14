@@ -81,16 +81,19 @@ installcheck-counted: installcheck
 	done
 
 # The checks of the crate, and that its code in the archive calls no
-# panic: a panic would abort the process of PostgreSQL.
+# Rust code outside it: no panic, which would abort the process of
+# PostgreSQL, and no function of core left out of line, which would
+# need a personality of unwinding that the archive does not have. Only
+# the system's functions may be undefined.
 .PHONY: check-crate
 check-crate: $(RUST_LIB)
 	cd $(CRATE) && $(CARGO) fmt --check && $(CARGO) clippy --release \
 		&& $(CARGO) clippy --all-targets && $(CARGO) test
 	@nm -u $(RUST_LIB) 2>/dev/null | awk \
 		'/^[^ \t].*\.o\)?:$$/ { crate = ($$0 ~ /pg_pmu_core/); seen += crate } \
-		 crate && /panicking|panic_bounds|panic_fmt/ { print; bad = 1 } \
+		 crate && $$NF ~ /^_?_(R[A-Za-z0-9]|ZN)/ { print; bad = 1 } \
 		 END { if (!seen) { print "pg_pmu_core: no code of the crate in the archive"; exit 1 } \
-		       if (bad) { print "pg_pmu_core: the crate can panic"; exit 1 } }'
+		       if (bad) { print "pg_pmu_core: the crate calls Rust code outside it"; exit 1 } }'
 
 .PHONY: installcheck-unloaded
 installcheck-unloaded:
