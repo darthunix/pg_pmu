@@ -18,6 +18,7 @@ compile_error!("pg_pmu needs a processor with native 64-bit atomics");
 pub mod counters;
 pub mod ffi;
 mod status;
+pub mod sysfs;
 
 pub use status::{Error, Status};
 

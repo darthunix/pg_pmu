@@ -32,6 +32,7 @@ PG_MODULE_MAGIC_EXT(.name = "pg_pmu",.version = "0.1.0");
 
 /* In test/abi.c. */
 extern void pmu_check_layout(void);
+extern void pmu_check_perf_abi(void);
 
 /*
  * What the module keeps in the state of one EXPLAIN. It lives in the
@@ -80,8 +81,12 @@ _PG_init(void)
 				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
 				 errmsg("pg_pmu must be loaded with shared_preload_libraries")));
 
-	/* The header written by hand must match the crate. */
+	/*
+	 * The header written by hand must match the crate, and on Linux the
+	 * crate must match the kernel's header.
+	 */
 	pmu_check_layout();
+	pmu_check_perf_abi();
 
 	DefineCustomIntVariable("pg_pmu.max_nested",
 							"Nested counting statements the server can run at once.",

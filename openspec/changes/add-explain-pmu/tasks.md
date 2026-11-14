@@ -44,9 +44,10 @@ with the lints of the design, and the commands each task names.
   crate and the suite on the Mac, and again with the suite built with
   `PG_PMU_COUNTERS=none` in each of its three commands, which must
   match the second output.
-- [ ] 2.2 Add the counters of Linux to the crate: `src/perf_abi.rs`
-  with the declarations of perf events, checked in `test/abi.c`
-  against `<linux/perf_event.h>` at compile time; the kinds of cores
+- [ ] 2.2 Add the counters of Linux to the crate:
+  `src/counters/perf_abi.rs` with the declarations of perf events,
+  compared in `test/abi.c` with `<linux/perf_event.h>` when the module
+  loads; the kinds of cores
   from the sysfs root it is given, and their coverage of the online
   processors; the pinned groups opened disabled, with neither kernel
   nor hypervisor; the checks of each read; the number of descriptors,

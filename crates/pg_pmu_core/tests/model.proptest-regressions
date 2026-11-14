@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 9e04af7edb522d214a82012c66df8714583c9f707503d1a3b8f1522970c27dda # shrinks to m = Machine { online: {0}, units: [Unit { cpus: {}, unit_type: Some(1) }], online_readable: true, listable: true, uniform: None, cuts: [0, 11400714819323198485], newline: false }
