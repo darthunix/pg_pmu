@@ -188,12 +188,29 @@ brackets, how much the largest exceeds it:
 - `count(*)` with PostgreSQL's own plan: 43 152 878 instructions
   (0.02 %), 7 596 853 cycles (0.9 %).
 
-Instructions repeat to a few in a hundred thousand, and so compare
-two plans of one query run by run. Cycles depend on the caches and on
-the clock of the core, and vary much more, most for short statements.
-Here Tessera's plan of the `count(*)` ran 7.9 times fewer instructions
-and 7.9 times fewer cycles than PostgreSQL's own. On macOS the counts
-include the kernel's work for the process.
+The same commands on a runner of GitHub's CI with AArch64 Linux, a
+virtual machine with four Neoverse N2 cores and Linux 7.0, shared with
+other machines; the workflow `Observations` builds and runs them
+(`.github/workflows/observations.yml`):
+
+- `SELECT 1`: 4 592 instructions (0 %), 4 301 cycles (325 %);
+- `count(*)` with Tessera: 6 070 572 instructions (0 %),
+  1 865 269 cycles (13.7 %);
+- `count(*)` with PostgreSQL's own plan: 43 310 950 instructions
+  (0 %), 13 584 830 cycles (1.4 %).
+
+Instructions repeat to a few in a hundred thousand on the Mac and
+exactly on Linux, and so compare two plans of one query run by run.
+Cycles depend on the caches and on the clock of the core, and vary
+much more, most for short statements and on a shared machine. Tessera's
+plan of the `count(*)` ran 7.9 times fewer instructions and cycles
+than PostgreSQL's own on the Mac, and 7.1 times fewer instructions and
+7.3 times fewer cycles on Linux. On macOS the counts include the
+kernel's work for the process, on Linux they do not, which is why
+`SELECT 1` counts fewer instructions there.
+
+An Intel Mac, a Core i5-1038NG7 with macOS 26.5, counts too: the
+suites pass there with their first expected outputs.
 
 ## Testing
 
