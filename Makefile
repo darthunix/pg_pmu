@@ -66,9 +66,20 @@ $(shlib): $(RUST_LIB)
 # A switch of the version removes the module while make reads this
 # file, before it looks at any file's time: make on macOS compares
 # times to the second, so a newer archive alone could miss a switch
-# made within the same second.
-ifneq ($(shell cat .pmu_variant 2>/dev/null),$(PMU_VARIANT))
+# made within the same second. Only a build switches: "make install"
+# with other settings than the "make" before it stops rather than build
+# another version, perhaps as root, and the other targets leave the
+# module as it is.
+PMU_BUILT = $(shell cat .pmu_variant 2>/dev/null)
+ifneq ($(PMU_BUILT),$(PMU_VARIANT))
+ifneq ($(PMU_BUILT),)
+ifneq ($(filter install,$(MAKECMDGOALS)),)
+$(error pg_pmu was built as "$(PMU_BUILT)"; give "make install" the PG_PMU_COUNTERS and PG_PMU_TEST of "make")
+endif
+endif
+ifneq ($(if $(MAKECMDGOALS),$(filter all install,$(MAKECMDGOALS)),all),)
 $(shell echo $(PMU_VARIANT) > .pmu_variant; rm -f $(shlib) workers.o)
+endif
 endif
 
 # Cargo runs only when a source of the crate has changed, so "make
