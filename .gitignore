@@ -18,3 +18,4 @@ regression.out
 /.agents/skills/openspec-*/
 /.claude/commands/opsx/
 /.claude/skills/openspec-*/
+/output_unloaded/

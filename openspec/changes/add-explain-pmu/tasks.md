@@ -16,7 +16,7 @@ with the lints of the design, and the commands each task names.
 
 ## 1. The module and its option
 
-- [ ] 1.1 Add the PGXS `Makefile` with its two runs, `pg_pmu.conf`,
+- [x] 1.1 Add the PGXS `Makefile` with its two runs, `pg_pmu.conf`,
   and `pg_pmu.c`: the refusal of any loading but
   `shared_preload_libraries` (55000), the setting `pg_pmu.max_nested`,
   the option `PMU`, the check that it comes with `ANALYZE` (22023), the
