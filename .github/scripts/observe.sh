@@ -31,6 +31,7 @@ awk '
   END {
     for (k = 1; k <= n; k++) {
       m = names[k]
+      if (!(m in imin) || imin[m] == 0) { printf "%s: no counts\n", m; continue }
       printf "%s: %d instructions (%.4f %%), %d cycles (%.1f %%)\n", m,
         imin[m], (imax[m] - imin[m]) * 100 / imin[m],
         cmin[m], (cmax[m] - cmin[m]) * 100 / cmin[m]
