@@ -33,6 +33,11 @@ fn counts_grow_with_the_work() {
             ),
             "{e:?}"
         );
+        // A machine that must count says so, and then this fails.
+        assert!(
+            std::env::var_os("PG_PMU_REQUIRE_COUNTERS").is_none(),
+            "this machine must count, but: {e:?}"
+        );
         eprintln!("this machine cannot count: {e:?}");
         return;
     }

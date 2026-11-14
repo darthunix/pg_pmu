@@ -4,7 +4,9 @@
 
 -- Run an EXPLAIN and return its lines, with the numbers of the lines of
 -- pg_pmu replaced by N, as they change from run to run; or one line
--- when the system cannot count, whichever of its codes it fails with.
+-- when the system cannot count, whichever of its three codes it fails
+-- with. The codes are matched exactly: a condition name would take in
+-- its whole class, such as disk_full beside insufficient_resources.
 CREATE FUNCTION pmu_explain(query text) RETURNS SETOF text
 LANGUAGE plpgsql AS $$
 DECLARE
@@ -17,8 +19,7 @@ BEGIN
     RETURN NEXT line;
   END LOOP;
 EXCEPTION
-  WHEN insufficient_privilege OR feature_not_supported
-       OR insufficient_resources THEN
+  WHEN SQLSTATE '42501' OR SQLSTATE '0A000' OR SQLSTATE '53000' THEN
     RETURN NEXT 'cannot count';
 END
 $$;

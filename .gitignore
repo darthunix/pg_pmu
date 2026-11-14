@@ -20,3 +20,4 @@ regression.out
 /.claude/skills/openspec-*/
 /output_unloaded/
 /crates/pg_pmu_core/target/
+/.pmu_counters

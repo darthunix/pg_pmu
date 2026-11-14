@@ -217,6 +217,10 @@ pmu_release_descriptors(uint32 n)
 		ReleaseExternalFD();
 }
 
+/* The error of the system, where the crate gave one. */
+#define PMU_SYSTEM_DETAIL() \
+	(os_error != 0 ? errdetail("The system said: %m.") : 0)
+
 /*
  * Turn a code of the crate into an error of PostgreSQL.
  */
@@ -230,7 +234,8 @@ pmu_report(int32 status, int32 os_error)
 		case PMU_NOT_PERMITTED:
 			ereport(ERROR,
 					(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
-					 errmsg("the system does not allow this process to count instructions: %m"),
+					 errmsg("the system does not allow this process to count instructions"),
+					 PMU_SYSTEM_DETAIL(),
 					 errhint("On Linux, set kernel.perf_event_paranoid to 2 or less, "
 							 "or give the server's processes CAP_PERFMON; "
 							 "in a container, its filter of system calls may refuse "
@@ -258,7 +263,8 @@ pmu_report(int32 status, int32 os_error)
 		case PMU_KIND_NOT_OPENABLE:
 			ereport(ERROR,
 					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-					 errmsg("the kernel cannot count on every kind of cores of this processor: %m"),
+					 errmsg("the kernel cannot count on every kind of cores of this processor"),
+					 PMU_SYSTEM_DETAIL(),
 					 errhint("On Intel this needs Linux 5.13 or later.")));
 			break;
 		case PMU_NO_FREE_COUNTER:
@@ -269,7 +275,8 @@ pmu_report(int32 status, int32 os_error)
 		case PMU_NO_DESCRIPTOR:
 			ereport(ERROR,
 					(errcode(ERRCODE_INSUFFICIENT_RESOURCES),
-					 errmsg("no file descriptor is left for the counters: %m")));
+					 errmsg("no file descriptor is left for the counters"),
+					 PMU_SYSTEM_DETAIL()));
 			break;
 		case PMU_COUNTER_LOST:
 			ereport(ERROR,
@@ -279,7 +286,8 @@ pmu_report(int32 status, int32 os_error)
 		case PMU_SYSTEM_ERROR:
 			ereport(ERROR,
 					(errcode(ERRCODE_INTERNAL_ERROR),
-					 errmsg("the counters of the processor failed: %m")));
+					 errmsg("the counters of the processor failed"),
+					 PMU_SYSTEM_DETAIL()));
 			break;
 		default:
 			ereport(ERROR,

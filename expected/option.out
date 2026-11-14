@@ -1,5 +1,9 @@
 -- The option PMU, on a server that preloads pg_pmu. Nothing here
 -- needs counters.
+-- spec: explain-pmu/Loaded at the start
+-- On a server that preloads the module, LOAD finds it loaded and does
+-- nothing.
+LOAD 'pg_pmu';
 -- spec: explain-pmu/Without ANALYZE
 \set VERBOSITY sqlstate
 EXPLAIN (PMU) SELECT 1;
