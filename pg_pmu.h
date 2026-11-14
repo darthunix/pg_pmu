@@ -12,7 +12,7 @@
 
 #include "executor/execdesc.h"
 
-#include "pg_pmu_core.h"
+#include "pmu_counters.h"
 
 /*
  * A cell of the shared memory that a counting statement holds for its

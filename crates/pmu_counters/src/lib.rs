@@ -3,7 +3,7 @@
 //! memory where the parallel workers report.
 //!
 //! The crate is linked into the C module as a static library. C calls
-//! the functions in [`ffi`], declared by hand in `pg_pmu_core.h`, and
+//! the functions in [`ffi`], declared by hand in `pmu_counters.h`, and
 //! turns their codes ([`Status`]) into errors of PostgreSQL.
 //!
 //! The crate does not use the standard library, except in its tests,

@@ -16,12 +16,12 @@ PGFILEDESC = "pg_pmu - counts of the processor in EXPLAIN ANALYZE"
 # The Rust crate, linked in as a static library. PG_PMU_COUNTERS=none
 # builds the version that cannot count; "make install" takes the same
 # setting as "make". Each version has a target directory of its own,
-# and the file .pmu_counters names the one the module is linked with.
-CRATE = crates/pg_pmu_core
+# and the file .pmu_variant names the one the module is linked with.
+CRATE = crates/pmu_counters
 CARGO ?= cargo
 PMU_COUNTERS = $(if $(filter none,$(PG_PMU_COUNTERS)),none,system)
 RUST_TARGET = $(CRATE)/target/$(PMU_COUNTERS)
-RUST_LIB = $(RUST_TARGET)/release/libpg_pmu_core.a
+RUST_LIB = $(RUST_TARGET)/release/libpmu_counters.a
 CARGO_FLAGS = --release --manifest-path $(CRATE)/Cargo.toml \
 	--target-dir $(RUST_TARGET)
 ifeq ($(PMU_COUNTERS),none)
@@ -31,7 +31,7 @@ RUST_SOURCES = $(shell find $(CRATE)/src -name '*.rs') \
 	$(CRATE)/Cargo.toml $(CRATE)/Cargo.lock
 SHLIB_LINK += $(RUST_LIB)
 # The crate's target directory is kept: "cargo clean" in the crate.
-EXTRA_CLEAN = output_unloaded tmp_check_unloaded .pmu_counters
+EXTRA_CLEAN = output_unloaded tmp_check_unloaded .pmu_variant
 
 # PG_PMU_TEST=workers-cannot-count builds a module whose parallel
 # workers fail to open their counters, for the suite
@@ -58,7 +58,7 @@ ifeq ($(PORTNAME),linux)
 # Keep the crate's symbols inside the module: PostgreSQL loads modules
 # with RTLD_GLOBAL, and another module written in Rust may define the
 # same ones.
-SHLIB_LINK += -Wl,--exclude-libs,libpg_pmu_core.a
+SHLIB_LINK += -Wl,--exclude-libs,libpmu_counters.a
 endif
 
 $(shlib): $(RUST_LIB)
@@ -67,8 +67,8 @@ $(shlib): $(RUST_LIB)
 # file, before it looks at any file's time: make on macOS compares
 # times to the second, so a newer archive alone could miss a switch
 # made within the same second.
-ifneq ($(shell cat .pmu_counters 2>/dev/null),$(PMU_VARIANT))
-$(shell echo $(PMU_VARIANT) > .pmu_counters; rm -f $(shlib) workers.o)
+ifneq ($(shell cat .pmu_variant 2>/dev/null),$(PMU_VARIANT))
+$(shell echo $(PMU_VARIANT) > .pmu_variant; rm -f $(shlib) workers.o)
 endif
 
 # Cargo runs only when a source of the crate has changed, so "make
@@ -101,10 +101,10 @@ check-crate: $(RUST_LIB)
 		&& $(CARGO) clippy --release -- -D warnings \
 		&& $(CARGO) clippy --all-targets -- -D warnings && $(CARGO) test
 	@nm -u $(RUST_LIB) 2>/dev/null | awk \
-		'/^[^ \t].*\.o\)?:$$/ { crate = ($$0 ~ /pg_pmu_core/); seen += crate } \
+		'/^[^ \t].*\.o\)?:$$/ { crate = ($$0 ~ /pmu_counters/); seen += crate } \
 		 crate && $$NF ~ /^_?(_R[A-Za-z0-9]|_ZN|rust_eh_personality|_Unwind_)/ { print; bad = 1 } \
-		 END { if (!seen) { print "pg_pmu_core: no code of the crate in the archive"; exit 1 } \
-		       if (bad) { print "pg_pmu_core: the crate calls Rust code outside it"; exit 1 } }'
+		 END { if (!seen) { print "pmu_counters: no code of the crate in the archive"; exit 1 } \
+		       if (bad) { print "pmu_counters: the crate calls Rust code outside it"; exit 1 } }'
 
 # Suites of systems that cannot count, which CI makes: Linux with
 # kernel.perf_event_paranoid set to 4, and a virtual machine with macOS.

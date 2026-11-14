@@ -11,7 +11,7 @@ built and why, and which test shows each thing it does, is in
 
 ## Building
 
-The module is C, with a Rust crate, `crates/pg_pmu_core`, linked in as
+The module is C, with a Rust crate, `crates/pmu_counters`, linked in as
 a static library, so building needs a Rust toolchain besides the
 server's headers:
 
@@ -22,7 +22,7 @@ make install PG_CONFIG=/path/to/pg_config
 
 Cargo fetches the crate's dependencies from crates.io, at the versions
 of `Cargo.lock`. To build without the network, run `cargo vendor` in
-`crates/pg_pmu_core` beforehand and point Cargo at the sources it
+`crates/pmu_counters` beforehand and point Cargo at the sources it
 writes, as it prints. Cargo runs only when a source of the crate has
 changed, so `make install` after `make` runs none. `make
 PG_PMU_COUNTERS=none` builds a version that cannot count, as on any

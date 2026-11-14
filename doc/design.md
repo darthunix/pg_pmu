@@ -7,7 +7,7 @@ its parallel workers, so that two ways to run the same query can be
 compared by their work. This document says what the module does, how
 it is built and why, and which tests show it. The module is written in
 C, with the cells of its shared memory and its counters of the system
-in a Rust crate, `pg_pmu_core`.
+in a Rust crate, `pmu_counters`.
 
 The module needs these things from PostgreSQL, all of them in
 PostgreSQL 19 and in master, with the same signatures:
@@ -586,7 +586,7 @@ asks it to open, take, give back and read.
 the constants of perf events, so the crate declares the few it uses.
 A wrong offset or bit there would count something else without a
 sign, so a C file of the module includes `<linux/perf_event.h>` beside
-`pg_pmu_core.h` and, when the module loads, compares with it what the
+`pmu_counters.h` and, when the module loads, compares with it what the
 crate reports it uses: the size of the structure, its offsets, the
 word of bit fields the crate sets, and the values of the constants and
 of the requests of `ioctl`. A mismatch stops the server's start. The
@@ -761,7 +761,7 @@ SQLSTATE XX000 before it runs, until the restart.
 ### The Rust part
 
 The cells of the shared memory and the counters of the system live in
-a Rust crate, `pg_pmu_core`, built as a static library and linked
+a Rust crate, `pmu_counters`, built as a static library and linked
 into the module. C keeps two things: getting memory and file
 descriptors from PostgreSQL, and the work inside PostgreSQL, that is
 the hooks, the settings, the frames and their records, and the
@@ -778,7 +778,7 @@ messages and hints.
  └──────────────┬─────────────────────────────────────┘
                 │ extern "C"
  ┌──────────────▼─────────────────────────────────────┐
- │ Rust: pg_pmu_core                                  │
+ │ Rust: pmu_counters                                  │
  │ cells:    layout, token, take, enter, add, leave,  │
  │           close, empty, open, read                 │
  │ counters: Linux perf events, macOS proc_pid_rusage │
@@ -1012,7 +1012,7 @@ AArch64 Linux always show one, those of x86-64 Linux on some hosts and
 not on others. The macOS runners are virtual machines that report no
 instructions, and run the second.
 
-The crate has its own checks, run in `crates/pg_pmu_core` by
+The crate has its own checks, run in `crates/pmu_counters` by
 `cargo test`, by `cargo test` with `--cfg loom` for the models of
 loom, and by `cargo kani`: the sizes and offsets of the layout; a
 report with an old token refused, also after the cell was taken again;
@@ -1114,11 +1114,11 @@ When the system cannot count:
 The shared memory of the workers:
 
 - The size at the start: `sql/option.sql`
-- A report after the return: `crates/pg_pmu_core/tests/loom.rs`,
+- A report after the return: `crates/pmu_counters/tests/loom.rs`,
   `a_late_report_against_a_new_taking`
-- A token that is not valid: `crates/pg_pmu_core/tests/ffi.rs`,
+- A token that is not valid: `crates/pmu_counters/tests/ffi.rs`,
   `workers_report_into_the_cell_of_their_token`
-- A return while a worker adds: `crates/pg_pmu_core/tests/loom.rs`,
+- A return while a worker adds: `crates/pmu_counters/tests/loom.rs`,
   `reports_against_a_close`
 
 ## Files
@@ -1128,7 +1128,7 @@ The shared memory of the workers:
   `PG_PMU_COUNTERS=none` builds the crate with the feature `none`, the
   version that cannot count, and `PG_PMU_TEST=workers-cannot-count`
   the module whose parallel workers cannot count, for its suite.
-- `crates/pg_pmu_core/`: the crate. `src/cells.rs`: the layout, the
+- `crates/pmu_counters/`: the crate. `src/cells.rs`: the layout, the
   token and the steps. `src/counters/mod.rs`: the references;
   `perf.rs`: the groups of perf events over the calls of the system;
   `linux.rs`: those calls on Linux; `perf_abi.rs`: the few
@@ -1140,7 +1140,7 @@ The shared memory of the workers:
   loom; `tests/counters.rs`: the tests on real counters; `tests/abi.rs`:
   the codes of the header against the crate's; `tests/ffi.rs`: the
   functions C calls for the cells; `Cargo.lock`.
-- `pg_pmu_core.h`: the C declarations of the crate's functions.
+- `pmu_counters.h`: the C declarations of the crate's functions.
 - `pg_pmu.h`: what the two C files of the module share.
 - `pg_pmu.c`: the option, the hooks, the frames, the depth, the
   records, the output, the errors of the counters.
@@ -1148,7 +1148,7 @@ The shared memory of the workers:
   `pg_pmu.cell`, the holds of cells, and the counting in the workers,
   all through the crate.
 - `test/abi.c`: the C file of the module that includes
-  `pg_pmu_core.h`, compares its types with the crate's, and on Linux
+  `pmu_counters.h`, compares its types with the crate's, and on Linux
   compares `src/counters/perf_abi.rs` with `<linux/perf_event.h>`,
   when the module loads.
 - `pg_pmu.conf`: the settings of the temporary server of the suite.

@@ -1,5 +1,5 @@
 //! The codes the crate returns to C. Their numbers are part of the
-//! interface: `pg_pmu_core.h` defines the same, and a test compares
+//! interface: `pmu_counters.h` defines the same, and a test compares
 //! them.
 
 /// What went wrong, as C turns it into an error of PostgreSQL. The

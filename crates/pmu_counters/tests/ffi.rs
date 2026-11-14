@@ -7,9 +7,9 @@
     clippy::arithmetic_side_effects
 )]
 
-use pg_pmu_core::Status;
-use pg_pmu_core::cells::{Contents, LOW_MASK, split};
-use pg_pmu_core::ffi::{
+use pmu_counters::Status;
+use pmu_counters::cells::{Contents, LOW_MASK, split};
+use pmu_counters::ffi::{
     pmu_cell_give_back, pmu_cell_read, pmu_cell_report, pmu_cell_report_failure, pmu_cell_take,
     pmu_cell_take_pool, pmu_cells_init, pmu_cells_size, pmu_token_parse,
 };

@@ -42,7 +42,7 @@
 #include "utils/memutils.h"
 
 #include "pg_pmu.h"
-#include "pg_pmu_core.h"
+#include "pmu_counters.h"
 
 /* Room for a token in decimal. */
 #define PMU_TOKEN_LEN 21
