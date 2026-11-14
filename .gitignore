@@ -13,5 +13,5 @@ regression.diffs
 regression.out
 
 /output_unloaded/
-/crates/pg_pmu_core/target/
-/.pmu_counters
+/crates/pmu_counters/target/
+/.pmu_variant

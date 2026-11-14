@@ -1,7 +1,7 @@
 /*-------------------------------------------------------------------------
  *
- * pg_pmu_core.h
- *		The functions of the Rust crate pg_pmu_core, which C calls.
+ * pmu_counters.h
+ *		The functions of the Rust crate pmu_counters, which C calls.
  *
  * Written by hand. The crate's tests compare the codes below with its
  * own, and the module compares the layout of PmuCounts with the
@@ -15,8 +15,8 @@
  *
  *-------------------------------------------------------------------------
  */
-#ifndef PG_PMU_CORE_H
-#define PG_PMU_CORE_H
+#ifndef PMU_COUNTERS_H
+#define PMU_COUNTERS_H
 
 #include <stddef.h>
 #include <stdint.h>
@@ -159,4 +159,4 @@ extern int32_t pmu_cell_report(const void *base, uint64_t token,
 extern int32_t pmu_cell_report_failure(const void *base, uint64_t token,
 									   uint32_t sqlstate);
 
-#endif							/* PG_PMU_CORE_H */
+#endif							/* PMU_COUNTERS_H */

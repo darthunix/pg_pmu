@@ -15,13 +15,13 @@ use std::collections::{BTreeSet, HashMap};
 
 use proptest::prelude::*;
 
-use pg_pmu_core::counters::perf::{Perf, PerfSys, open_error};
-use pg_pmu_core::counters::perf_abi::{
+use pmu_counters::counters::perf::{Perf, PerfSys, open_error};
+use pmu_counters::counters::perf_abi::{
     LEADER_FLAGS, MEMBER_FLAGS, PERF_EVENT_IOC_DISABLE, PERF_EVENT_IOC_ENABLE, PerfEventAttr,
 };
-use pg_pmu_core::counters::{Backend, Counters, Counts};
-use pg_pmu_core::sysfs::{self, Fs, MAX_KINDS, Malformed, Plan};
-use pg_pmu_core::{Error, Status};
+use pmu_counters::counters::{Backend, Counters, Counts};
+use pmu_counters::sysfs::{self, Fs, MAX_KINDS, Malformed, Plan};
+use pmu_counters::{Error, Status};
 
 // ---------------------------------------------------------------------
 // The kinds of cores
@@ -538,7 +538,7 @@ fn a_next_opening_succeeds_after_a_failure() {
 
 #[test]
 fn leaders_count_instructions_and_members_cycles_of_their_kind() {
-    use pg_pmu_core::counters::perf_abi::{
+    use pmu_counters::counters::perf_abi::{
         PERF_COUNT_HW_CPU_CYCLES, PERF_COUNT_HW_INSTRUCTIONS, PERF_FORMAT_GROUP,
         PERF_IOC_FLAG_GROUP, PERF_TYPE_HARDWARE,
     };
@@ -621,7 +621,7 @@ fn errors_of_opening_mean_what_the_spec_says() {
 
 #[test]
 fn reads_of_a_group_are_checked() {
-    use pg_pmu_core::counters::perf::parse_group_read;
+    use pmu_counters::counters::perf::parse_group_read;
     let words = |w: &[u64]| w.iter().flat_map(|x| x.to_ne_bytes()).collect::<Vec<u8>>();
     assert_eq!(parse_group_read(&words(&[2, 7, 9])), Some((7, 9)));
     assert_eq!(parse_group_read(&words(&[1, 7, 9])), None);
@@ -664,7 +664,7 @@ fn groups_are_added() {
 // The cells
 // ---------------------------------------------------------------------
 
-use pg_pmu_core::cells::{self, Cell, Contents, EMPTYING, G_MASK, LOW_MASK};
+use pmu_counters::cells::{self, Cell, Contents, EMPTYING, G_MASK, LOW_MASK};
 
 /// Which generation an operation uses: the last one taken, one taken
 /// before, the last with one of its 44 bits flipped, or any number.

@@ -3,7 +3,7 @@
  * abi.c
  *		Checks of the boundary between the module and the Rust crate.
  *
- * pg_pmu_core.h is written by hand, so the module compares its types
+ * pmu_counters.h is written by hand, so the module compares its types
  * with the crate's when it loads, and refuses to start on a mismatch
  * rather than read counts at the wrong offsets.
  *
@@ -20,7 +20,7 @@
 #include <linux/perf_event.h>
 #endif
 
-#include "../pg_pmu_core.h"
+#include "../pmu_counters.h"
 
 void		pmu_check_layout(void);
 
@@ -40,7 +40,7 @@ pmu_check_layout(void)
 		layout.contents_failures != offsetof(PmuCellContents, failures))
 		ereport(ERROR,
 				(errcode(ERRCODE_INTERNAL_ERROR),
-				 errmsg("pg_pmu_core.h does not match the crate pg_pmu_core"),
+				 errmsg("pmu_counters.h does not match the crate pmu_counters"),
 				 errdetail("PmuCounts has %u bytes and cycles at %u, PmuPerfAbi "
 						   "%u bytes, PmuCellContents %u bytes and failures at "
 						   "%u in the crate; %zu, %zu, %zu, %zu and %zu in the "
@@ -81,7 +81,7 @@ flags_word(const PmuPerfAbi *abi, bool leader)
 		if ((uint64_t) (rust) != (uint64_t) (header)) \
 			ereport(ERROR, \
 					(errcode(ERRCODE_INTERNAL_ERROR), \
-					 errmsg("the crate pg_pmu_core does not match <linux/perf_event.h>"), \
+					 errmsg("the crate pmu_counters does not match <linux/perf_event.h>"), \
 					 errdetail("%s is %llu in the crate and %llu in the header.", \
 							   #header, (unsigned long long) (rust), \
 							   (unsigned long long) (header)))); \

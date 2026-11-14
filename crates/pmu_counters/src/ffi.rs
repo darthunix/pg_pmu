@@ -1,4 +1,4 @@
-//! The functions C calls, declared in `pg_pmu_core.h`.
+//! The functions C calls, declared in `pmu_counters.h`.
 //!
 //! Each returns a [`Status`] as an `int32_t`, and writes the error of
 //! the system to `os_error`, 0 when there is none. A null pointer is
@@ -87,7 +87,7 @@ pub unsafe extern "C" fn pmu_core_layout(out: *mut PmuLayout) {
     unsafe { out.write(layout) };
 }
 
-/// `PmuPerfAbi` of `pg_pmu_core.h`: what the crate puts in a
+/// `PmuPerfAbi` of `pmu_counters.h`: what the crate puts in a
 /// `perf_event_attr` and passes to the kernel, so that C can compare it
 /// with `<linux/perf_event.h>` when the module loads on Linux.
 #[repr(C)]

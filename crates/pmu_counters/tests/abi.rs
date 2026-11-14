@@ -1,4 +1,4 @@
-//! The codes of `pg_pmu_core.h` against the crate's.
+//! The codes of `pmu_counters.h` against the crate's.
 
 #![allow(
     clippy::unwrap_used,
@@ -8,7 +8,7 @@
     clippy::arithmetic_side_effects
 )]
 
-use pg_pmu_core::Status;
+use pmu_counters::Status;
 
 const ALL: [Status; 16] = [
     Status::Ok,
@@ -53,7 +53,7 @@ fn c_name(status: Status) -> &'static str {
 
 #[test]
 fn header_codes_match_the_crate() {
-    let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../pg_pmu_core.h");
+    let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../pmu_counters.h");
     let header = std::fs::read_to_string(path).expect("the header");
     let defines: Vec<(String, i32)> = header
         .lines()

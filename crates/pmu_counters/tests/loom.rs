@@ -15,8 +15,8 @@
 use loom::sync::Arc;
 use loom::thread;
 
-use pg_pmu_core::Status;
-use pg_pmu_core::cells::{self, Cell, Contents};
+use pmu_counters::Status;
+use pmu_counters::cells::{self, Cell, Contents};
 
 /// A worker's report: enter, add, leave. Whether it was taken.
 fn report(cell: &Cell, g: u64, instructions: u64) -> bool {

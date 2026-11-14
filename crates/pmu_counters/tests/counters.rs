@@ -9,8 +9,8 @@
     clippy::arithmetic_side_effects
 )]
 
-use pg_pmu_core::Status;
-use pg_pmu_core::counters::{Counters, platform};
+use pmu_counters::Status;
+use pmu_counters::counters::{Counters, platform};
 
 /// Work the compiler cannot remove.
 fn work(n: u64) -> u64 {
@@ -37,7 +37,7 @@ fn cannot_count(status: Status) -> bool {
 
 /// Plan and open the counters of this machine, or return `None` where
 /// it cannot count, unless PG_PMU_REQUIRE_COUNTERS says it must.
-fn counters() -> Option<Counters<pg_pmu_core::counters::Platform>> {
+fn counters() -> Option<Counters<pmu_counters::counters::Platform>> {
     let mut c = Counters::new(platform());
     match c.plan(c"/sys").and_then(|_| c.open()) {
         Ok(()) => Some(c),

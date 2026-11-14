@@ -29,7 +29,7 @@
 #include "utils/guc.h"
 
 #include "pg_pmu.h"
-#include "pg_pmu_core.h"
+#include "pmu_counters.h"
 
 PG_MODULE_MAGIC_EXT(.name = "pg_pmu",.version = "0.1.0");
 
