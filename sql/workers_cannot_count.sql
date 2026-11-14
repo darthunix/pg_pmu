@@ -30,7 +30,6 @@ EXPLAIN (ANALYZE, PMU, COSTS off, TIMING off, SUMMARY off)
 
 \set VERBOSITY default
 
--- case: A caught failure of a worker
 DO $$
 BEGIN
   EXECUTE 'EXPLAIN (ANALYZE, PMU) SELECT caught()';
