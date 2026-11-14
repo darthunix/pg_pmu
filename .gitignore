@@ -19,3 +19,4 @@ regression.out
 /.claude/commands/opsx/
 /.claude/skills/openspec-*/
 /output_unloaded/
+/crates/pg_pmu_core/target/

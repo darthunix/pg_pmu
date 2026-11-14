@@ -9,10 +9,23 @@ It supports PostgreSQL 19 and master, on Linux and macOS.
 
 ## Building
 
+The module is C, with a Rust crate, `crates/pg_pmu_core`, linked in as
+a static library, so building needs a Rust toolchain besides the
+server's headers:
+
 ```sh
 make PG_CONFIG=/path/to/pg_config
 make install PG_CONFIG=/path/to/pg_config
 ```
+
+Cargo fetches the crate's dependencies from crates.io, at the versions
+of `Cargo.lock`. To build without the network, run `cargo vendor` in
+`crates/pg_pmu_core` beforehand and point Cargo at the sources it
+writes, as it prints. `make PG_PMU_COUNTERS=none` builds a version that
+cannot count, as on any system other than Linux and macOS.
+
+The crate never panics on purpose: a panic would abort the process of
+PostgreSQL, and the server would restart every session.
 
 ## Loading
 
@@ -47,7 +60,13 @@ auto_explain cannot use it, as it explains a plan after it has run.
 
 ## Testing
 
-The suites start temporary servers of their own:
+The crate has its own tests:
+
+```sh
+cd crates/pg_pmu_core && cargo test && cargo clippy --all-targets
+```
+
+The suites of SQL start temporary servers of their own:
 
 ```sh
 make installcheck PG_CONFIG=/path/to/pg_config \
@@ -55,7 +74,9 @@ make installcheck PG_CONFIG=/path/to/pg_config \
 ```
 
 The suite `option` uses auto_explain, so the server's `contrib` must
-be installed.
+be installed. On a system that cannot count, the suites match their
+second expected outputs, where each counting EXPLAIN prints "cannot
+count".
 
 ## License
 
