@@ -146,6 +146,55 @@ it, 0A000 when it has no counters for the process, as in a virtual
 machine, and 53000 when no hardware counter or file descriptor is
 free.
 
+## Observations
+
+How much counts vary from run to run, and an example with
+[Tessera](https://github.com/darthunix/tessera), a batch executor for
+PostgreSQL. On an Apple M5 Pro with 64 GB, macOS 26.6.2, the machine
+otherwise idle; PostgreSQL master at 311df1dc, built without
+assertions; Tessera at 2cea4cea, a release build; both modules
+preloaded, pg_pmu last, so that its hooks wrap Tessera's:
+
+```
+shared_preload_libraries = 'tessera, tessera_nodes, tessera_kernels, pg_pmu'
+```
+
+```sql
+CREATE EXTENSION tessera;
+CREATE TABLE t AS SELECT g FROM generate_series(1, 100000) g;
+VACUUM ANALYZE t;
+```
+
+Each statement ran eleven times in one session, and the first run,
+which fills the caches of the backend, is left out:
+
+```sh
+run() {
+  for i in $(seq 11); do echo "$1"; done |
+    psql -XAt | grep 'Execution PMU' | tail -10
+}
+run "EXPLAIN (ANALYZE, PMU, TIMING off) SELECT 1;"
+run "EXPLAIN (ANALYZE, PMU, TIMING off) SELECT count(*) FROM t;"
+run "SET tessera.enable = off;
+     EXPLAIN (ANALYZE, PMU, TIMING off) SELECT count(*) FROM t;"
+```
+
+The counts of the execution, the smallest of the ten and, in
+brackets, how much the largest exceeds it:
+
+- `SELECT 1`: 10 837 instructions (0.23 %), 3 482 cycles (165 %);
+- `count(*)` with Tessera: 5 469 677 instructions (0.0003 %),
+  956 601 cycles (5.8 %);
+- `count(*)` with PostgreSQL's own plan: 43 152 878 instructions
+  (0.02 %), 7 596 853 cycles (0.9 %).
+
+Instructions repeat to a few in a hundred thousand, and so compare
+two plans of one query run by run. Cycles depend on the caches and on
+the clock of the core, and vary much more, most for short statements.
+Here Tessera's plan of the `count(*)` ran 7.9 times fewer instructions
+and 7.9 times fewer cycles than PostgreSQL's own. On macOS the counts
+include the kernel's work for the process.
+
 ## Testing
 
 The crate has its own checks, with Clippy and a look for panics in
