@@ -20,6 +20,12 @@
  * was taken. A cell that goes back hands what it held to the hold below
  * it, the cell of the statement around.
  *
+ * A worker counts its execution of the plan whose rows go to the tuple
+ * queue of the Gather, and reports once into the cell of its token: at
+ * the end of its finish, or from a callback of its exit when it fails
+ * before. A worker that cannot count reports its failure, and the
+ * statement fails at its finish even when a function caught the error.
+ *
  * Copyright (c) 2026, Denis Smirnov
  *
  *-------------------------------------------------------------------------
@@ -29,6 +35,7 @@
 #include "access/parallel.h"
 #include "access/xact.h"
 #include "miscadmin.h"
+#include "storage/ipc.h"
 #include "storage/procnumber.h"
 #include "storage/shmem.h"
 #include "utils/guc.h"
@@ -64,11 +71,19 @@ static void *pmu_cells = NULL;
 /* The holds of this backend, the innermost first. */
 static PmuHold *pmu_holds = NULL;
 
+/* A worker that counts: its token, its plan and its counts at the start. */
+static bool pmu_worker_counting = false;
+static uint64 pmu_worker_token = 0;
+static QueryDesc *pmu_worker_query = NULL;
+static PmuCounts pmu_worker_counts;
+static bool pmu_worker_exit_set = false;
+
 static void pmu_shmem_request(void *arg);
 static void pmu_shmem_init(void *arg);
 static bool pmu_cell_check(char **newval, void **extra, GucSource source);
 static void pmu_hand_down(const PmuCellContents *contents);
 static void pmu_give_back_on_abort(void);
+static void pmu_worker_exit(int code, Datum arg);
 static void pmu_xact_callback(XactEvent event, void *arg);
 static void pmu_subxact_callback(SubXactEvent event, SubTransactionId mySubid,
 								 SubTransactionId parentSubid, void *arg);
@@ -303,6 +318,145 @@ pmu_give_back_on_abort(void)
 				 errhint("Counting statements of backends with this number fail until the server restarts.") :
 				 errhint("The pool of nested statements has one cell less until the server restarts.")));
 	pmu_hand_down(&contents);
+}
+
+/*
+ * What the cell of a hold holds, with what nested cells handed down to
+ * it; zeros without a hold. Read at the start and at the finish of a
+ * candidate for the statement, the difference is the part of the
+ * workers.
+ */
+void
+pmu_hold_read(PmuHold *hold, PmuCellContents *out)
+{
+	int32		status;
+
+	memset(out, 0, sizeof(*out));
+	if (hold == NULL)
+		return;
+	status = pmu_cell_read(pmu_cells, hold->token, out);
+	if (status != PMU_OK)
+		pmu_report(status, 0);
+	out->instructions += hold->nested.instructions;
+	out->cycles += hold->nested.cycles;
+	out->failures += hold->nested.failures;
+	if (out->sqlstate == 0)
+		out->sqlstate = hold->nested.sqlstate;
+}
+
+/*
+ * The start of a worker's execution of the plan: its rows go to the
+ * tuple queue of the Gather. Other queries of the worker, and the
+ * workers of a parallel index build, are not counted. A worker whose
+ * statement counts takes its token from pg_pmu.cell, opens its counters
+ * and takes a reference to them; when it cannot, it reports its failure
+ * and raises the error.
+ */
+void
+pmu_worker_start(QueryDesc *queryDesc)
+{
+	uint64		token;
+	int32		status;
+
+	if (!IsParallelWorker() || pmu_worker_counting ||
+		queryDesc->dest == NULL || queryDesc->dest->mydest != DestTupleQueue)
+		return;
+
+	status = pmu_token_parse(pmu_cells, pmu_cell, &token);
+	if (status != PMU_OK)
+		pmu_report(status, 0);
+	if (token == 0)
+		return;
+
+	PG_TRY();
+	{
+		int32		os_error = 0;
+
+		pmu_open_counters();
+		status = pmu_counters_acquire(&pmu_worker_counts, &os_error);
+		if (status != PMU_OK)
+			pmu_report(status, os_error);
+	}
+	PG_CATCH();
+	{
+		(void) pmu_cell_report_failure(pmu_cells, token,
+									   (uint32) geterrcode());
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+
+	if (!pmu_worker_exit_set)
+	{
+		before_shmem_exit(pmu_worker_exit, (Datum) 0);
+		pmu_worker_exit_set = true;
+	}
+	pmu_worker_token = token;
+	pmu_worker_query = queryDesc;
+	pmu_worker_counting = true;
+}
+
+/*
+ * The finish of the worker's execution of the plan: report the counts
+ * once and give the reference back. A report that the cell refuses
+ * fails the worker.
+ */
+void
+pmu_worker_finish(QueryDesc *queryDesc)
+{
+	PmuCounts	now;
+	int32		os_error = 0;
+	int32		status;
+
+	if (!pmu_worker_counting || queryDesc != pmu_worker_query)
+		return;
+	pmu_worker_counting = false;
+
+	status = pmu_counters_read(&now, &os_error);
+	if (status != PMU_OK)
+	{
+		(void) pmu_cell_report_failure(pmu_cells, pmu_worker_token,
+									   (uint32) pmu_status_sqlstate(status));
+		pmu_report(status, os_error);
+	}
+	status = pmu_cell_report(pmu_cells, pmu_worker_token,
+							 now.instructions - pmu_worker_counts.instructions,
+							 now.cycles - pmu_worker_counts.cycles);
+	if (status != PMU_OK)
+		pmu_report(status, 0);
+	status = pmu_counters_release(&os_error);
+	if (status != PMU_OK)
+		pmu_report(status, os_error);
+}
+
+/*
+ * A worker that fails before its finish reports from its exit what it
+ * counted until then, or that it could not read its counters. No error
+ * may be raised here, so a refused report goes to the log.
+ */
+static void
+pmu_worker_exit(int code, Datum arg)
+{
+	PmuCounts	now;
+	int32		os_error = 0;
+	int32		status;
+
+	if (!pmu_worker_counting)
+		return;
+	pmu_worker_counting = false;
+
+	status = pmu_counters_read(&now, &os_error);
+	if (status == PMU_OK)
+		status = pmu_cell_report(pmu_cells, pmu_worker_token,
+								 now.instructions - pmu_worker_counts.instructions,
+								 now.cycles - pmu_worker_counts.cycles);
+	else
+		status = pmu_cell_report_failure(pmu_cells, pmu_worker_token,
+										 (uint32) pmu_status_sqlstate(status));
+	if (status != PMU_OK)
+		ereport(WARNING,
+				(errcode(ERRCODE_INTERNAL_ERROR),
+				 errmsg("internal error of pg_pmu: the cell refused the report of a worker that failed"),
+				 errdetail("The crate returned code %d.", status)));
 }
 
 /*

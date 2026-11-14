@@ -138,4 +138,25 @@ extern int32_t pmu_cell_take_pool(const void *base, uint64_t *token);
 extern int32_t pmu_cell_give_back(const void *base, uint64_t token,
 								  PmuCellContents *out);
 
+/* Read what the cell of token holds; refused as a return. */
+extern int32_t pmu_cell_read(const void *base, uint64_t token,
+							 PmuCellContents *out);
+
+/*
+ * Read a token from its decimal form: 0 for no cell, else a token valid
+ * for this memory, or PMU_BAD_TOKEN.
+ */
+extern int32_t pmu_token_parse(const void *base, const char *text,
+							   uint64_t *token);
+
+/*
+ * The report of a worker, of its counts or of its failure to count with
+ * the packed SQLSTATE of its error: one entry into the cell, refused with
+ * PMU_BAD_TOKEN or PMU_STALE_TOKEN and adding nothing.
+ */
+extern int32_t pmu_cell_report(const void *base, uint64_t token,
+							   uint64_t instructions, uint64_t cycles);
+extern int32_t pmu_cell_report_failure(const void *base, uint64_t token,
+									   uint32_t sqlstate);
+
 #endif							/* PG_PMU_CORE_H */

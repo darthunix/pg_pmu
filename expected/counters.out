@@ -454,3 +454,232 @@ SELECT * FROM pmu_explain($$
  Execution PMU: instructions=N cycles=N
 (3 rows)
 
+-- The parallel workers. pmu_workers shows, from the JSON of a counting
+-- EXPLAIN with VERBOSE: the workers launched, whether they counted, and
+-- whether their part is within the counts of the execution.
+CREATE FUNCTION pmu_workers(query text, OUT launched int,
+                            OUT workers_counted bool, OUT within bool)
+LANGUAGE sql AS $$
+  SELECT jsonb_path_query_first(j, '$.**."Workers Launched"')::int,
+         (j ->> 'Workers Instructions')::numeric > 0,
+         (j ->> 'Workers Instructions')::numeric
+           <= (j ->> 'Execution Instructions')::numeric
+  FROM pmu_json(query) AS j
+$$;
+RESET max_parallel_workers_per_gather;
+-- spec: explain-pmu/No workers
+SELECT pmu_json($$EXPLAIN (ANALYZE, PMU, VERBOSE, FORMAT JSON)
+                  SELECT count(*) FROM small$$) ? 'Workers Instructions'
+       AS has_part_of_workers;
+ has_part_of_workers 
+---------------------
+ f
+(1 row)
+
+-- spec: explain-pmu/A hidden Gather
+SET debug_parallel_query = regress;
+SELECT j::text NOT LIKE '%Gather%' AS gather_hidden,
+       (j ->> 'Workers Instructions')::numeric > 0 AS workers_counted
+FROM pmu_json($$EXPLAIN (ANALYZE, PMU, VERBOSE, FORMAT JSON)
+                SELECT count(*) FROM small$$) AS j;
+ gather_hidden | workers_counted 
+---------------+-----------------
+ t             | t
+(1 row)
+
+RESET debug_parallel_query;
+-- Parallel plans for the tables of the suite from here on.
+SET parallel_setup_cost = 0;
+SET parallel_tuple_cost = 0;
+SET min_parallel_table_scan_size = 0;
+-- spec: explain-pmu/The workers do the scan
+SET parallel_leader_participation = off;
+SELECT * FROM pmu_workers($$EXPLAIN (ANALYZE, PMU, VERBOSE, FORMAT JSON)
+                            SELECT count(*) FROM big$$);
+ launched | workers_counted | within 
+----------+-----------------+--------
+        2 | t               | t
+(1 row)
+
+SELECT * FROM pmu_explain($$
+  EXPLAIN (ANALYZE, PMU, VERBOSE, COSTS off, TIMING off, SUMMARY off,
+           BUFFERS off)
+  SELECT count(*) FROM big$$) AS line WHERE line ~ 'PMU:';
+                  line                  
+----------------------------------------
+ Planning PMU: instructions=N cycles=N
+ Execution PMU: instructions=N cycles=N
+ Workers PMU: instructions=N cycles=N
+(3 rows)
+
+RESET parallel_leader_participation;
+-- spec: explain-pmu/In a worker
+SELECT pg_backend_pid() AS leader \gset
+CREATE FUNCTION explain_in_worker(leader int) RETURNS text
+LANGUAGE plpgsql PARALLEL SAFE AS $$
+DECLARE
+  doc jsonb;
+BEGIN
+  EXECUTE 'EXPLAIN (ANALYZE, PMU, VERBOSE, FORMAT JSON)
+           SELECT count(*) FROM small' INTO doc;
+  RETURN format('in a worker: %s, counted: %s, part of the workers: %s',
+                pg_backend_pid() <> leader,
+                (doc -> 0 ->> 'Execution Instructions')::numeric > 0,
+                doc -> 0 ? 'Workers Instructions');
+EXCEPTION
+  WHEN OTHERS THEN
+    IF SQLSTATE IN ('42501', '0A000', '53000') THEN
+      RETURN 'cannot count';
+    ELSE
+      RAISE;
+    END IF;
+END
+$$;
+SET debug_parallel_query = on;
+SELECT explain_in_worker(:leader);
+                 explain_in_worker                  
+----------------------------------------------------
+ in a worker: t, counted: t, part of the workers: f
+(1 row)
+
+RESET debug_parallel_query;
+-- A counting EXPLAIN of a parallel count(*) run by a function above the
+-- Gather of the outer statement; it says its facts in a notice.
+CREATE FUNCTION inner_explain() RETURNS int
+LANGUAGE plpgsql PARALLEL RESTRICTED AS $$
+DECLARE
+  f record;
+BEGIN
+  SELECT * INTO f FROM pmu_workers('EXPLAIN (ANALYZE, PMU, VERBOSE,
+    FORMAT JSON) SELECT count(*) FROM big');
+  RAISE NOTICE 'inner: launched %, workers counted %, within %',
+    f.launched, f.workers_counted, f.within;
+  RETURN 1;
+END
+$$;
+-- spec: explain-pmu/Inside a parallel plan
+WITH q AS (SELECT pmu_json($$EXPLAIN (ANALYZE, PMU, FORMAT JSON)
+                             SELECT count(*) FROM big$$) AS j),
+     o AS (SELECT pmu_json($$EXPLAIN (ANALYZE, PMU, VERBOSE, FORMAT JSON)
+                             SELECT count(*), inner_explain() FROM small$$)
+                  AS j)
+SELECT jsonb_path_query_first(o.j, '$.**."Workers Launched"')::int
+         AS outer_launched,
+       (o.j ->> 'Workers Instructions')::numeric > 0 AS outer_workers_counted,
+       (o.j ->> 'Execution Instructions')::numeric
+         > (q.j ->> 'Execution Instructions')::numeric / 2 AS includes_inner
+FROM q, o;
+NOTICE:  inner: launched 2, workers counted t, within t
+ outer_launched | outer_workers_counted | includes_inner 
+----------------+-----------------------+----------------
+              2 | t                     | t
+(1 row)
+
+-- A plain parallel query whose function, run by the backend while the
+-- workers still scan, runs a counting EXPLAIN: the workers of the plain
+-- query count for nobody.
+CREATE FUNCTION explain_at(n int) RETURNS int
+LANGUAGE plpgsql PARALLEL RESTRICTED AS $$
+BEGIN
+  IF n = 500 THEN
+    PERFORM inner_explain();
+  END IF;
+  RETURN n;
+END
+$$;
+SELECT count(explain_at(g)) FROM small;
+NOTICE:  inner: launched 2, workers counted t, within t
+ count 
+-------
+  1000
+(1 row)
+
+-- Workers that run a function with a query count it too.
+CREATE FUNCTION in_small(n int) RETURNS bool
+LANGUAGE plpgsql PARALLEL SAFE STABLE AS $$
+BEGIN
+  RETURN EXISTS (SELECT 1 FROM small WHERE g = n);
+END
+$$;
+SELECT * FROM pmu_workers($$EXPLAIN (ANALYZE, PMU, VERBOSE, FORMAT JSON)
+                            SELECT count(*) FROM small WHERE in_small(g)$$);
+ launched | workers_counted | within 
+----------+-----------------+--------
+        2 | t               | t
+(1 row)
+
+-- Failures of parallel queries caught by a function inside a counting
+-- statement. boom() fails each worker on its first row, and the backend
+-- does not scan, so every worker fails before its finish and reports
+-- what it counted from its exit.
+SET parallel_leader_participation = off;
+CREATE FUNCTION boom(n int) RETURNS bool
+LANGUAGE plpgsql PARALLEL SAFE AS $$
+BEGIN
+  RAISE division_by_zero;
+END
+$$;
+CREATE FUNCTION failing_query() RETURNS int
+LANGUAGE plpgsql AS $$
+BEGIN
+  BEGIN
+    PERFORM count(*) FROM big WHERE boom(g);
+  EXCEPTION WHEN division_by_zero THEN
+    NULL;
+  END;
+  RETURN 1;
+END
+$$;
+SELECT * FROM pmu_workers($$EXPLAIN (ANALYZE, PMU, VERBOSE, FORMAT JSON)
+                            SELECT failing_query()$$);
+ launched | workers_counted | within 
+----------+-----------------+--------
+          | t               | t
+(1 row)
+
+-- spec: explain-pmu/A nested statement fails
+CREATE FUNCTION failing_nested() RETURNS int
+LANGUAGE plpgsql AS $$
+BEGIN
+  BEGIN
+    EXECUTE 'EXPLAIN (ANALYZE, PMU) SELECT count(*) FROM big WHERE boom(g)';
+  EXCEPTION WHEN division_by_zero THEN
+    NULL;
+  END;
+  RETURN 1;
+END
+$$;
+SELECT * FROM pmu_workers($$EXPLAIN (ANALYZE, PMU, VERBOSE, FORMAT JSON)
+                            SELECT failing_nested()$$);
+ launched | workers_counted | within 
+----------+-----------------+--------
+          | t               | t
+(1 row)
+
+-- spec: explain-pmu/Two nested statements fail together
+CREATE FUNCTION fail_inner() RETURNS int
+LANGUAGE plpgsql AS $$
+BEGIN
+  EXECUTE 'EXPLAIN (ANALYZE, PMU) SELECT count(*) FROM big WHERE boom(g)';
+  RETURN 1;
+END
+$$;
+CREATE FUNCTION fail_both() RETURNS int
+LANGUAGE plpgsql AS $$
+BEGIN
+  BEGIN
+    EXECUTE 'EXPLAIN (ANALYZE, PMU) SELECT fail_inner()';
+  EXCEPTION WHEN division_by_zero THEN
+    NULL;
+  END;
+  RETURN 1;
+END
+$$;
+SELECT * FROM pmu_workers($$EXPLAIN (ANALYZE, PMU, VERBOSE, FORMAT JSON)
+                            SELECT fail_both()$$);
+ launched | workers_counted | within 
+----------+-----------------+--------
+          | t               | t
+(1 row)
+
+RESET parallel_leader_participation;
