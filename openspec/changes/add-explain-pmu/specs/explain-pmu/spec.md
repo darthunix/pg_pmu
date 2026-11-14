@@ -452,8 +452,8 @@ and master it is the sum of `max_connections`,
 `autovacuum_worker_slots`, `max_worker_processes`, `max_wal_senders`
 and 2. PostgreSQL allows fewer than 2^18 backends and fewer than 2^18
 workers, so N + K + 1 and the largest W fit in 20 bits, and G has 44.
-All the fields are atomic integers; the module SHALL NOT build where
-the processor has no native 64-bit atomics.
+All the fields of a cell are atomic integers; the module SHALL NOT
+build where the processor has no native 64-bit atomics.
 
 The state of a cell SHALL be one of these three:
 

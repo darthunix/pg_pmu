@@ -26,6 +26,7 @@ use crate::sysfs::Malformed;
 
 /// Bits of the writers, and of the number of a cell in a token.
 pub const LOW_BITS: u32 = 20;
+/// The writers of a state, or the number of a cell in a token.
 pub const LOW_MASK: u64 = (1 << LOW_BITS) - 1;
 /// The writers of a cell that is being emptied.
 pub const EMPTYING: u64 = LOW_MASK;
@@ -40,6 +41,7 @@ pub struct Header {
     pub n: u32,
     /// The cells of the pool.
     pub k: u32,
+    /// Zero, so that the cells start at 16 bytes.
     pub zero: u64,
 }
 
@@ -47,10 +49,15 @@ pub struct Header {
 #[repr(C)]
 #[derive(Debug, Default)]
 pub struct Cell {
+    /// The instructions the workers added.
     pub instructions: AtomicU64,
+    /// The cycles the workers added.
     pub cycles: AtomicU64,
+    /// The generation and the writers.
     pub state: AtomicU64,
+    /// The workers that could not count.
     pub failures: AtomicU32,
+    /// The SQLSTATE of the last of them, as PostgreSQL packs it.
     pub sqlstate: AtomicU32,
 }
 
@@ -58,9 +65,13 @@ pub struct Cell {
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Contents {
+    /// The instructions the workers added.
     pub instructions: u64,
+    /// The cycles the workers added.
     pub cycles: u64,
+    /// The workers that could not count.
     pub failures: u32,
+    /// The SQLSTATE of the last of them.
     pub sqlstate: u32,
 }
 
@@ -138,6 +149,8 @@ impl Cell {
 
     /// Enter the cell to add to it, while its generation is `g`, the
     /// generation of the token. The check and the entry are one step.
+    /// Only a worker that entered may add, fail and leave, once: `leave`
+    /// cannot tell whose entry it ends.
     pub fn enter(&self, g: u64) -> Result<(), Status> {
         let mut s = self.state.load(SeqCst);
         loop {
@@ -188,8 +201,11 @@ impl Cell {
         }
     }
 
-    /// Read what the cell holds, taken with generation `g`, while no
-    /// worker is adding.
+    /// Read what the cell holds, taken with generation `g`. A worker
+    /// inside at the moment of the check makes it refused as busy; one
+    /// that enters after the check would give a mixed read, which only
+    /// a fault of the module allows, as no worker of the statement runs
+    /// when it reads.
     pub fn read(&self, g: u64) -> Result<Contents, Status> {
         let s = self.state.load(SeqCst);
         if generation(s) != g || g & 1 == 0 {
