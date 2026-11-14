@@ -24,6 +24,9 @@ libc = { version = "0.2", default-features = false }
 pg_pmu_core = { path = ".", features = ["std"] }
 proptest = "1"
 
+[target.'cfg(loom)'.dependencies]
+loom = "0.7"
+
 [profile.dev]
 panic = "abort"
 

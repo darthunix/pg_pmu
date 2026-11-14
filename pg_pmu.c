@@ -734,6 +734,27 @@ pmu_report(int32 status, int32 os_error)
 					 errmsg("the counters of the processor failed"),
 					 PMU_SYSTEM_DETAIL()));
 			break;
+		case PMU_NO_CELL:
+			ereport(ERROR,
+					(errcode(ERRCODE_INSUFFICIENT_RESOURCES),
+					 errmsg("too many nested counting statements run at once"),
+					 errhint("Raise pg_pmu.max_nested.")));
+			break;
+		case PMU_STALE_TOKEN:
+			ereport(ERROR,
+					(errcode(ERRCODE_INTERNAL_ERROR),
+					 errmsg("internal error of pg_pmu: the cell of the workers was given back")));
+			break;
+		case PMU_CELL_BUSY:
+			ereport(ERROR,
+					(errcode(ERRCODE_INTERNAL_ERROR),
+					 errmsg("internal error of pg_pmu: a worker still adds to the cell")));
+			break;
+		case PMU_BAD_TOKEN:
+			ereport(ERROR,
+					(errcode(ERRCODE_INTERNAL_ERROR),
+					 errmsg("internal error of pg_pmu: the token of the workers is not valid")));
+			break;
 		default:
 			ereport(ERROR,
 					(errcode(ERRCODE_INTERNAL_ERROR),
