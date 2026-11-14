@@ -128,7 +128,7 @@ with the lints of the design, and the commands each task names.
   `pg_pmu.cell`, a third nested statement at once, a nested one that
   fails inside two nested `EXCEPTION` blocks and its cell taken again
   after them. Verify with the suite on both builds.
-- [ ] 5.2 Count in the workers: their execution of the plan by its
+- [x] 5.2 Count in the workers: their execution of the plan by its
   tuple queue, the token checked when they start to count, the report
   through the crate at the finish or from the exit callback, the count
   of failures, the refusal of an old or not valid token (XX000), the

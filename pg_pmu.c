@@ -42,16 +42,20 @@ extern void pmu_check_perf_abi(void);
 
 /*
  * One start of the executor at the depth of a counting EXPLAIN: a
- * candidate for the statement. Its counts are read when the executor
- * starts and when it has finished; the end of the executor removes it.
+ * candidate for the statement. Its counts, and the cell of the frame's
+ * workers, are read when the executor starts and when it has finished;
+ * the end of the executor removes it.
  */
 typedef struct PmuRecord
 {
 	struct PmuRecord *next;
 	QueryDesc  *query;			/* until its end */
 	PlannedStmt *plan;
-	PmuCounts	start;
+	PmuHold    *hold;			/* the cell of the frame's workers, if any */
+	PmuCounts	start;			/* of this process */
 	PmuCounts	finish;
+	PmuCellContents cell_start; /* of the workers */
+	PmuCellContents cell_finish;
 	bool		finished;
 } PmuRecord;
 
@@ -135,7 +139,6 @@ static ExecutorFinish_hook_type prev_ExecutorFinish = NULL;
 static ExecutorEnd_hook_type prev_ExecutorEnd = NULL;
 
 static void pmu_release_descriptors(uint32 n);
-static void pmu_open_counters(void);
 static PmuExplainState *pmu_ensure_state(ExplainState *es);
 static void pmu_option_handler(ExplainState *es, DefElem *opt,
 							   ParseState *pstate);
@@ -149,7 +152,7 @@ static void pmu_frame_pop(PmuFrame *frame, bool report);
 static void pmu_free_records(PmuFrame *frame);
 static PmuRecord *pmu_find_record(QueryDesc *query);
 static void pmu_print(ExplainState *es, const char *phase,
-					  const PmuCounts *start, const PmuCounts *end);
+					  uint64 instructions, uint64 cycles);
 static void pmu_explain_per_plan(PlannedStmt *plannedstmt, IntoClause *into,
 								 ExplainState *es, const char *queryString,
 								 ParamListInfo params,
@@ -470,6 +473,8 @@ pmu_ExecutorStart(QueryDesc *queryDesc, int eflags)
 {
 	PmuFrame   *frame = pmu_frames;
 
+	pmu_worker_start(queryDesc);
+
 	if (frame != NULL && frame->counting && pmu_depth == frame->depth)
 	{
 		PmuRecord  *record = MemoryContextAllocZero(frame->cxt,
@@ -477,6 +482,8 @@ pmu_ExecutorStart(QueryDesc *queryDesc, int eflags)
 
 		record->query = queryDesc;
 		record->plan = queryDesc->plannedstmt;
+		record->hold = frame->hold;
+		pmu_hold_read(record->hold, &record->cell_start);
 		pmu_read(&record->start);
 		record->next = frame->records;
 		frame->records = record;
@@ -509,8 +516,22 @@ pmu_ExecutorFinish(QueryDesc *queryDesc)
 	if (record != NULL && !record->finished)
 	{
 		pmu_read(&record->finish);
+		pmu_hold_read(record->hold, &record->cell_finish);
 		record->finished = true;
+
+		/*
+		 * A worker that could not count raised its error; when a function
+		 * caught it, the counts would leave the worker out.
+		 */
+		if (record->cell_finish.failures != record->cell_start.failures)
+			ereport(ERROR,
+					(errcode(record->cell_finish.sqlstate != 0 ?
+							 (int) record->cell_finish.sqlstate :
+							 ERRCODE_INTERNAL_ERROR),
+					 errmsg("a parallel worker of the statement could not count"),
+					 errdetail("A function caught the error of the worker.")));
 	}
+	pmu_worker_finish(queryDesc);
 }
 
 /*
@@ -543,12 +564,9 @@ pmu_ExecutorEnd(QueryDesc *queryDesc)
  * properties named "<phase> Instructions" and "<phase> Cycles".
  */
 static void
-pmu_print(ExplainState *es, const char *phase, const PmuCounts *start,
-		  const PmuCounts *end)
+pmu_print(ExplainState *es, const char *phase, uint64 instructions,
+		  uint64 cycles)
 {
-	uint64		instructions = end->instructions - start->instructions;
-	uint64		cycles = end->cycles - start->cycles;
-
 	if (es->format == EXPLAIN_FORMAT_TEXT)
 	{
 		ExplainIndentText(es);
@@ -572,7 +590,8 @@ pmu_print(ExplainState *es, const char *phase, const PmuCounts *start,
  * The hook that runs for each plan after EXPLAIN ANALYZE has run and
  * printed it, before the executor ends: print the counts of its planning,
  * if this EXPLAIN planned it, and those of the record of this plan whose
- * execution has not ended, then forget the frame's records. It does
+ * execution has not ended, with the part of the workers under VERBOSE
+ * when a worker counted, then forget the frame's records. It does
  * nothing for an EXPLAIN without the option, and for the plans
  * auto_explain logs.
  */
@@ -583,6 +602,8 @@ pmu_explain_per_plan(PlannedStmt *plannedstmt, IntoClause *into,
 {
 	PmuExplainState *state;
 	PmuRecord  *record = NULL;
+	uint64		workers_instructions;
+	uint64		workers_cycles;
 
 	if (prev_explain_per_plan_hook)
 		prev_explain_per_plan_hook(plannedstmt, into, es, queryString,
@@ -605,9 +626,21 @@ pmu_explain_per_plan(PlannedStmt *plannedstmt, IntoClause *into,
 				 errmsg("pg_pmu found no counts of the plan it prints")));
 
 	if (state->planned == plannedstmt)
-		pmu_print(es, "Planning", &state->plan_start, &state->plan_end);
+		pmu_print(es, "Planning",
+				  state->plan_end.instructions - state->plan_start.instructions,
+				  state->plan_end.cycles - state->plan_start.cycles);
 	state->planned = NULL;
-	pmu_print(es, "Execution", &record->start, &record->finish);
+
+	/* The counts of the execution include the part of the workers. */
+	workers_instructions = record->cell_finish.instructions -
+		record->cell_start.instructions;
+	workers_cycles = record->cell_finish.cycles - record->cell_start.cycles;
+	pmu_print(es, "Execution",
+			  record->finish.instructions - record->start.instructions +
+			  workers_instructions,
+			  record->finish.cycles - record->start.cycles + workers_cycles);
+	if (es->verbose && workers_instructions > 0)
+		pmu_print(es, "Workers", workers_instructions, workers_cycles);
 	pmu_free_records(state->frame);
 }
 
@@ -617,7 +650,7 @@ pmu_explain_per_plan(PlannedStmt *plannedstmt, IntoClause *into,
  * files, and go back to it when the opening fails. The crate owns the
  * descriptors themselves and closes them on a failure.
  */
-static void
+void
 pmu_open_counters(void)
 {
 	uint32		descriptors = 0;
@@ -661,6 +694,32 @@ pmu_release_descriptors(uint32 n)
 	(os_error != 0 ? errdetail("The system said: %m.") : 0)
 
 /*
+ * The SQLSTATE of a code of the crate, as the spec gives it.
+ */
+int
+pmu_status_sqlstate(int32 status)
+{
+	switch (status)
+	{
+		case PMU_NOT_PERMITTED:
+			return ERRCODE_INSUFFICIENT_PRIVILEGE;
+		case PMU_NO_SYSTEM:
+		case PMU_NO_COUNTERS:
+		case PMU_CORES_NOT_COVERED:
+		case PMU_KIND_NOT_OPENABLE:
+		case PMU_TOO_MANY_KINDS:
+			return ERRCODE_FEATURE_NOT_SUPPORTED;
+		case PMU_NO_FREE_COUNTER:
+		case PMU_NO_DESCRIPTOR:
+		case PMU_COUNTER_LOST:
+		case PMU_NO_CELL:
+			return ERRCODE_INSUFFICIENT_RESOURCES;
+		default:
+			return ERRCODE_INTERNAL_ERROR;
+	}
+}
+
+/*
  * Turn a code of the crate into an error of PostgreSQL.
  */
 void
@@ -672,7 +731,7 @@ pmu_report(int32 status, int32 os_error)
 	{
 		case PMU_NOT_PERMITTED:
 			ereport(ERROR,
-					(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+					(errcode(pmu_status_sqlstate(status)),
 					 errmsg("the system does not allow this process to count instructions"),
 					 PMU_SYSTEM_DETAIL(),
 					 errhint("On Linux, set kernel.perf_event_paranoid to 2 or less, "
@@ -682,82 +741,82 @@ pmu_report(int32 status, int32 os_error)
 			break;
 		case PMU_NO_SYSTEM:
 			ereport(ERROR,
-					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					(errcode(pmu_status_sqlstate(status)),
 					 errmsg("pg_pmu cannot count on this system"),
 					 errdetail("It counts on Linux and macOS, and this build of it "
 							   "has no counters.")));
 			break;
 		case PMU_NO_COUNTERS:
 			ereport(ERROR,
-					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					(errcode(pmu_status_sqlstate(status)),
 					 errmsg("the system keeps no counters of instructions for this process"),
 					 errdetail("A virtual machine often gives none.")));
 			break;
 		case PMU_CORES_NOT_COVERED:
 			ereport(ERROR,
-					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					(errcode(pmu_status_sqlstate(status)),
 					 errmsg("the kinds of cores in sysfs do not cover all the processors online"),
 					 errdetail("Counting on some cores only would show a part of the work.")));
 			break;
 		case PMU_TOO_MANY_KINDS:
 			ereport(ERROR,
-					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					(errcode(pmu_status_sqlstate(status)),
 					 errmsg("the processor has more kinds of cores than pg_pmu counts on"),
 					 errdetail("It counts on up to four kinds.")));
 			break;
 		case PMU_KIND_NOT_OPENABLE:
 			ereport(ERROR,
-					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					(errcode(pmu_status_sqlstate(status)),
 					 errmsg("the kernel cannot count on every kind of cores of this processor"),
 					 PMU_SYSTEM_DETAIL(),
 					 errhint("On Intel this needs Linux 5.13 or later.")));
 			break;
 		case PMU_NO_FREE_COUNTER:
 			ereport(ERROR,
-					(errcode(ERRCODE_INSUFFICIENT_RESOURCES),
+					(errcode(pmu_status_sqlstate(status)),
 					 errmsg("no hardware counter is free for this process")));
 			break;
 		case PMU_NO_DESCRIPTOR:
 			ereport(ERROR,
-					(errcode(ERRCODE_INSUFFICIENT_RESOURCES),
+					(errcode(pmu_status_sqlstate(status)),
 					 errmsg("no file descriptor is left for the counters"),
 					 PMU_SYSTEM_DETAIL()));
 			break;
 		case PMU_COUNTER_LOST:
 			ereport(ERROR,
-					(errcode(ERRCODE_INSUFFICIENT_RESOURCES),
+					(errcode(pmu_status_sqlstate(status)),
 					 errmsg("the system took a counter away while the statement ran")));
 			break;
 		case PMU_SYSTEM_ERROR:
 			ereport(ERROR,
-					(errcode(ERRCODE_INTERNAL_ERROR),
+					(errcode(pmu_status_sqlstate(status)),
 					 errmsg("the counters of the processor failed"),
 					 PMU_SYSTEM_DETAIL()));
 			break;
 		case PMU_NO_CELL:
 			ereport(ERROR,
-					(errcode(ERRCODE_INSUFFICIENT_RESOURCES),
+					(errcode(pmu_status_sqlstate(status)),
 					 errmsg("too many nested counting statements run at once"),
 					 errhint("Raise pg_pmu.max_nested.")));
 			break;
 		case PMU_STALE_TOKEN:
 			ereport(ERROR,
-					(errcode(ERRCODE_INTERNAL_ERROR),
+					(errcode(pmu_status_sqlstate(status)),
 					 errmsg("internal error of pg_pmu: the cell of the workers was given back")));
 			break;
 		case PMU_CELL_BUSY:
 			ereport(ERROR,
-					(errcode(ERRCODE_INTERNAL_ERROR),
+					(errcode(pmu_status_sqlstate(status)),
 					 errmsg("internal error of pg_pmu: a worker still adds to the cell")));
 			break;
 		case PMU_BAD_TOKEN:
 			ereport(ERROR,
-					(errcode(ERRCODE_INTERNAL_ERROR),
+					(errcode(pmu_status_sqlstate(status)),
 					 errmsg("internal error of pg_pmu: the token of the workers is not valid")));
 			break;
 		default:
 			ereport(ERROR,
-					(errcode(ERRCODE_INTERNAL_ERROR),
+					(errcode(pmu_status_sqlstate(status)),
 					 errmsg("internal error of pg_pmu: code %d", status)));
 			break;
 	}

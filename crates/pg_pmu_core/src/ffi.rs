@@ -380,13 +380,120 @@ pub unsafe extern "C" fn pmu_cell_give_back(
             return Err(Status::Internal);
         }
         // SAFETY: see above.
-        let (cells, _) = unsafe { cells_at(base) }?;
-        let count = u32::try_from(cells.len()).map_err(|_| Status::Internal)?;
-        let (i, g) = cells::split(token, count).ok_or(Status::BadToken)?;
-        let contents = cells.get(i).ok_or(Status::BadToken)?.give_back(g)?;
+        let (cell, g) = unsafe { cell_of(base, token) }?;
+        let contents = cell.give_back(g)?;
         // SAFETY: C passes the address of a PmuCellContents.
         unsafe { out.write(contents) };
         Ok(())
     })();
     code(result)
+}
+
+/// The cell and the generation of `token`, or `PMU_BAD_TOKEN` for a
+/// token that is not valid for this memory.
+///
+/// # Safety
+///
+/// As for `cells_at`.
+unsafe fn cell_of<'a>(base: *const u8, token: u64) -> Result<(&'a Cell, u64), Status> {
+    // SAFETY: see above.
+    let (cells, _) = unsafe { cells_at(base) }?;
+    let count = u32::try_from(cells.len()).map_err(|_| Status::Internal)?;
+    let (i, g) = cells::split(token, count).ok_or(Status::BadToken)?;
+    Ok((cells.get(i).ok_or(Status::BadToken)?, g))
+}
+
+/// Read what the cell of `token` holds, refused as for a return.
+///
+/// # Safety
+///
+/// As for `pmu_cell_give_back`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn pmu_cell_read(base: *const u8, token: u64, out: *mut Contents) -> i32 {
+    let result = (|| {
+        if out.is_null() {
+            return Err(Status::Internal);
+        }
+        // SAFETY: see above.
+        let (cell, g) = unsafe { cell_of(base, token) }?;
+        let contents = cell.read(g)?;
+        // SAFETY: C passes the address of a PmuCellContents.
+        unsafe { out.write(contents) };
+        Ok(())
+    })();
+    code(result)
+}
+
+/// Read a token from its decimal form, the value of `pg_pmu.cell`: 0
+/// for no cell, else a token valid for this memory, or
+/// `PMU_BAD_TOKEN`.
+///
+/// # Safety
+///
+/// `base` as for `pmu_cell_take`; `text` a string ending in zero;
+/// `token` the address of a `uint64_t`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn pmu_token_parse(
+    base: *const u8,
+    text: *const c_char,
+    token: *mut u64,
+) -> i32 {
+    let result = (|| {
+        if text.is_null() || token.is_null() {
+            return Err(Status::Internal);
+        }
+        // SAFETY: C passes a string ending in zero.
+        let text = unsafe { CStr::from_ptr(text) };
+        let t = cells::parse_token(text.to_bytes()).map_err(|_| Status::BadToken)?;
+        if t != 0 {
+            // SAFETY: see above.
+            unsafe { cell_of(base, t) }?;
+        }
+        // SAFETY: C passes the address of a uint64_t.
+        unsafe { token.write(t) };
+        Ok(())
+    })();
+    code(result)
+}
+
+/// A worker's report: enter the cell of `token`, add the counts, leave.
+/// Refused, adding nothing, for a token that is not valid
+/// (`PMU_BAD_TOKEN`) or whose cell was given back (`PMU_STALE_TOKEN`).
+///
+/// # Safety
+///
+/// `base` as for `pmu_cell_take`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn pmu_cell_report(
+    base: *const u8,
+    token: u64,
+    instructions: u64,
+    cycles: u64,
+) -> i32 {
+    // SAFETY: see above.
+    code(unsafe { cell_of(base, token) }.and_then(|(cell, g)| {
+        cell.enter(g)?;
+        cell.add(instructions, cycles);
+        cell.leave()
+    }))
+}
+
+/// The report of a worker that could not count, with the SQLSTATE of
+/// its error as PostgreSQL packs it; refused as `pmu_cell_report`.
+///
+/// # Safety
+///
+/// As for `pmu_cell_report`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn pmu_cell_report_failure(
+    base: *const u8,
+    token: u64,
+    sqlstate: u32,
+) -> i32 {
+    // SAFETY: see above.
+    code(unsafe { cell_of(base, token) }.and_then(|(cell, g)| {
+        cell.enter(g)?;
+        cell.fail(sqlstate);
+        cell.leave()
+    }))
 }

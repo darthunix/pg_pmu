@@ -10,7 +10,8 @@
 use pg_pmu_core::Status;
 use pg_pmu_core::cells::{Contents, LOW_MASK, split};
 use pg_pmu_core::ffi::{
-    pmu_cell_give_back, pmu_cell_take, pmu_cell_take_pool, pmu_cells_init, pmu_cells_size,
+    pmu_cell_give_back, pmu_cell_read, pmu_cell_report, pmu_cell_report_failure, pmu_cell_take,
+    pmu_cell_take_pool, pmu_cells_init, pmu_cells_size, pmu_token_parse,
 };
 
 const OK: i32 = Status::Ok as i32;
@@ -127,4 +128,76 @@ fn null_pointers_are_refused() {
         Status::Internal as i32
     );
     assert!(give_back(base, token).is_ok());
+}
+
+fn read(base: *const u8, token: u64) -> Result<Contents, i32> {
+    let mut out = Contents::default();
+    match unsafe { pmu_cell_read(base, token, &mut out) } {
+        OK => Ok(out),
+        e => Err(e),
+    }
+}
+
+fn parse(base: *const u8, text: &std::ffi::CStr) -> Result<u64, i32> {
+    let mut token = u64::MAX;
+    match unsafe { pmu_token_parse(base, text.as_ptr(), &mut token) } {
+        OK => Ok(token),
+        e => Err(e),
+    }
+}
+
+#[test]
+fn workers_report_into_the_cell_of_their_token() {
+    let mem = memory(2, 1);
+    let base = mem.as_ptr().cast::<u8>();
+    let mut token = 0;
+    assert_eq!(unsafe { pmu_cell_take_pool(base, &mut token) }, OK);
+
+    assert_eq!(unsafe { pmu_cell_report(base, token, 10, 20) }, OK);
+    assert_eq!(unsafe { pmu_cell_report(base, token, 1, 2) }, OK);
+    assert_eq!(unsafe { pmu_cell_report_failure(base, token, 53) }, OK);
+    let want = Contents {
+        instructions: 11,
+        cycles: 22,
+        failures: 1,
+        sqlstate: 53,
+    };
+    assert_eq!(read(base, token), Ok(want));
+    assert_eq!(give_back(base, token), Ok(want));
+
+    // After the return the token is old, and nothing is added.
+    assert_eq!(
+        unsafe { pmu_cell_report(base, token, 5, 5) },
+        Status::StaleToken as i32
+    );
+    assert_eq!(
+        unsafe { pmu_cell_report_failure(base, token, 53) },
+        Status::StaleToken as i32
+    );
+    assert_eq!(read(base, token), Err(Status::StaleToken as i32));
+    assert_eq!(unsafe { pmu_cell_take_pool(base, &mut token) }, OK);
+    assert_eq!(read(base, token), Ok(Contents::default()));
+    assert_eq!(
+        unsafe { pmu_cell_report(base, (1 << 20) | 9, 5, 5) },
+        Status::BadToken as i32
+    );
+}
+
+#[test]
+fn tokens_are_read_from_the_setting() {
+    let mem = memory(2, 1);
+    let base = mem.as_ptr().cast::<u8>();
+    let mut token = 0;
+    assert_eq!(unsafe { pmu_cell_take(base, 1, &mut token) }, OK);
+    let text = std::ffi::CString::new(token.to_string()).unwrap();
+    assert_eq!(parse(base, &text), Ok(token));
+    assert_eq!(parse(base, c"0"), Ok(0));
+    for bad in [c"", c"-1", c" 1", c"x", c"18446744073709551616"] {
+        assert_eq!(parse(base, bad), Err(Status::BadToken as i32));
+    }
+    // Valid in form, but not a cell of this memory.
+    let beyond = std::ffi::CString::new(((1u64 << 20) | 4).to_string()).unwrap();
+    assert_eq!(parse(base, &beyond), Err(Status::BadToken as i32));
+    let even = std::ffi::CString::new(((2u64 << 20) | 1).to_string()).unwrap();
+    assert_eq!(parse(base, &even), Err(Status::BadToken as i32));
 }

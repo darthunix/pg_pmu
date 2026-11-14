@@ -50,7 +50,15 @@ that has the setting.
 - `pg_pmu.max_nested` (16, from 0 to 1024, set before the start): the
   number of nested counting statements, an `EXPLAIN (ANALYZE, PMU)`
   that starts while another one of the same backend runs, that the
-  whole server can run at once.
+  whole server can run at once. A nested statement that finds all of
+  them in use fails with SQLSTATE 53000 before it runs. Each costs 32
+  bytes of shared memory; the module takes 16 + 32 * (N + K) bytes in
+  all, N being the number of backends the server can run and K this
+  setting.
+
+The module also has a setting `pg_pmu.cell` for its own use, hidden,
+which tells the parallel workers of a statement where to report. A
+session cannot change it.
 
 ## Use
 
@@ -74,10 +82,10 @@ has no counts of planning, even when the cache makes it during the
 EXPLAIN. In JSON and YAML the counts are the properties "Planning
 Instructions", "Planning Cycles", "Execution Instructions" and
 "Execution Cycles" of the query, in XML the elements with the spaces
-replaced by hyphens, `Planning-Instructions` and so on. They come after the
-plan, the triggers, JIT and serialization, and before "Execution
-Time", also with `SUMMARY off`. Each plan of an EXPLAIN has its own,
-as with a rule that makes two.
+replaced by hyphens, `Planning-Instructions` and so on. They come
+after the plan, the triggers, JIT and serialization, and before
+"Execution Time", also with `SUMMARY off`. Each plan of an EXPLAIN has
+its own, as with a rule that makes two.
 
 `PMU` takes the same values as PostgreSQL's own boolean options, and
 needs `ANALYZE`: without it EXPLAIN fails with SQLSTATE 22023.
@@ -100,6 +108,37 @@ that passes them in batches. `TIMING off` makes it smaller.
 On Linux the counts are of the user space of the backend's thread; on
 macOS of the whole process, kernel included. Counts of the two
 systems are not comparable.
+
+### Parallel workers
+
+The parallel workers of a statement count their own work and add it
+to the counts of the execution: each counts its execution of the
+plan, with the queries it runs inside. With `VERBOSE` the output also
+shows their part, when one of them counted; here two workers scanned
+less than a tenth of the table, the backend the rest:
+
+```
+ Execution PMU: instructions=52818896 cycles=9396448
+ Workers PMU: instructions=7248083 cycles=1922555
+```
+
+in JSON and YAML "Workers Instructions" and "Workers Cycles". It is
+shown also when EXPLAIN hides the Gather, as with
+`debug_parallel_query` set to `regress`. A counting EXPLAIN that runs
+inside another one counts the workers of its own plans, and the outer
+one includes all of its work, its workers too, also when it fails and
+a function catches the error. The workers of a statement that does
+not count do not count, and an EXPLAIN that a worker runs has no part
+of the workers.
+
+A worker that cannot count fails with the same error as a backend
+that cannot, and so does the statement. When a function catches that
+error, the counting statement around it still fails at its end, with
+the same SQLSTATE, rather than show counts without the worker. An
+ordinary error of a worker is not such a failure: what the worker did
+until then is counted.
+
+### When the system cannot count
 
 When the system cannot count, a counting EXPLAIN fails before the
 statement runs: with SQLSTATE 42501 when the system does not allow
