@@ -92,6 +92,10 @@ ANALYZE small, big;
 -- spec: explain-pmu/Loaded at the start
 -- spec: explain-pmu/With ANALYZE
 -- spec: explain-pmu/Text
+-- On a system that counts, the counts; checked there by
+-- "make installcheck-counted".
+-- spec: explain-pmu/Linux, counting allowed
+-- spec: explain-pmu/Apple silicon
 SELECT * FROM pmu_explain($$
   EXPLAIN (ANALYZE, PMU, COSTS off, TIMING off, BUFFERS off) SELECT 1$$);
               pmu_explain               

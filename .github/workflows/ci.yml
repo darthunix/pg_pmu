@@ -75,6 +75,19 @@ jobs:
             done
             echo "$t matched no expected output"
           done
+      # The runners of macOS are virtual machines, which report no
+      # instructions for a process.
+      - name: Suite of a virtual machine (macOS)
+        if: runner.os == 'macOS'
+        run: make installcheck-vm EXTRA_REGRESS_OPTS="--temp-instance=$RUNNER_TEMP/cluster-vm"
+      # At 4 an Ubuntu kernel refuses the events to every process
+      # without privileges.
+      - name: Suite of a kernel that refuses (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo sysctl -w kernel.perf_event_paranoid=4
+          make installcheck-paranoid EXTRA_REGRESS_OPTS="--temp-instance=$RUNNER_TEMP/cluster-paranoid"
+          sudo sysctl -w kernel.perf_event_paranoid=2
       # Where the runner counts, the build without counters is the only
       # one that shows the second expected outputs.
       - name: Suites of the build without counters

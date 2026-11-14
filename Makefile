@@ -33,6 +33,16 @@ SHLIB_LINK += $(RUST_LIB)
 # The crate's target directory is kept: "cargo clean" in the crate.
 EXTRA_CLEAN = output_unloaded tmp_check_unloaded .pmu_counters
 
+# PG_PMU_TEST=workers-cannot-count builds a module whose parallel
+# workers fail to open their counters, for the suite
+# workers_cannot_count, which runs only on a machine that counts.
+ifeq ($(PG_PMU_TEST),workers-cannot-count)
+PG_CPPFLAGS += -DPMU_TEST_WORKERS_CANNOT_COUNT
+else ifneq ($(PG_PMU_TEST),)
+$(error PG_PMU_TEST is workers-cannot-count or empty)
+endif
+PMU_VARIANT = $(PMU_COUNTERS)$(if $(PG_PMU_TEST), $(PG_PMU_TEST))
+
 # The suites with a second expected output for a system that cannot
 # count; "make installcheck-counted" demands the first.
 COUNTED_SUITES = counters
@@ -57,8 +67,8 @@ $(shlib): $(RUST_LIB)
 # file, before it looks at any file's time: make on macOS compares
 # times to the second, so a newer archive alone could miss a switch
 # made within the same second.
-ifneq ($(shell cat .pmu_counters 2>/dev/null),$(PMU_COUNTERS))
-$(shell echo $(PMU_COUNTERS) > .pmu_counters; rm -f $(shlib))
+ifneq ($(shell cat .pmu_counters 2>/dev/null),$(PMU_VARIANT))
+$(shell echo $(PMU_VARIANT) > .pmu_counters; rm -f $(shlib) workers.o)
 endif
 
 # Cargo runs only when a source of the crate has changed, so "make
@@ -94,6 +104,20 @@ check-crate: $(RUST_LIB)
 		 crate && $$NF ~ /^_?(_R[A-Za-z0-9]|_ZN|rust_eh_personality|_Unwind_)/ { print; bad = 1 } \
 		 END { if (!seen) { print "pg_pmu_core: no code of the crate in the archive"; exit 1 } \
 		       if (bad) { print "pg_pmu_core: the crate calls Rust code outside it"; exit 1 } }'
+
+# Suites of systems that cannot count, which CI makes: Linux with
+# kernel.perf_event_paranoid set to 4, and a virtual machine with macOS.
+.PHONY: installcheck-paranoid installcheck-vm
+installcheck-paranoid:
+	$(pg_regress_installcheck) $(REGRESS_OPTS) paranoid
+installcheck-vm:
+	$(pg_regress_installcheck) $(REGRESS_OPTS) vm
+
+# With the build PG_PMU_TEST=workers-cannot-count, on a machine that
+# counts: a function catches the error of a worker that cannot count.
+.PHONY: installcheck-workers-cannot-count
+installcheck-workers-cannot-count:
+	$(pg_regress_installcheck) $(REGRESS_OPTS) workers_cannot_count
 
 .PHONY: installcheck-unloaded
 installcheck-unloaded:

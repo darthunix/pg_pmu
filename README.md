@@ -169,6 +169,20 @@ count". On a machine that must count, `make installcheck-counted`
 fails if a suite matched one of those, and `PG_PMU_REQUIRE_COUNTERS=1`
 makes the crate's tests fail where they cannot count.
 
+A worker that cannot count while its backend can is shown by a build
+whose parallel workers fail to open their counters, on a machine that
+counts:
+
+```sh
+make PG_PMU_TEST=workers-cannot-count PG_CONFIG=/path/to/pg_config
+make PG_PMU_TEST=workers-cannot-count install PG_CONFIG=/path/to/pg_config
+make installcheck-workers-cannot-count PG_CONFIG=/path/to/pg_config \
+    EXTRA_REGRESS_OPTS="--temp-instance=$PWD/tmp_check"
+```
+
+Build the module again without `PG_PMU_TEST` afterwards: that build is
+for this suite only.
+
 ## License
 
 The PostgreSQL License; see [LICENSE](LICENSE).

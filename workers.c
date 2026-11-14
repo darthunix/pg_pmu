@@ -381,6 +381,10 @@ pmu_worker_start(QueryDesc *queryDesc)
 		int32		os_error = 0;
 
 		pmu_open_counters();
+#ifdef PMU_TEST_WORKERS_CANNOT_COUNT
+		/* The build of the suite workers_cannot_count. */
+		pmu_report(PMU_NO_COUNTERS, 0);
+#endif
 		status = pmu_counters_acquire(&pmu_worker_counts, &os_error);
 		if (status != PMU_OK)
 			pmu_report(status, os_error);
