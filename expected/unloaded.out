@@ -1,0 +1,12 @@
+-- Runs on a server that does not preload pg_pmu.
+-- spec: explain-pmu/Not loaded
+\set VERBOSITY sqlstate
+EXPLAIN (ANALYZE, PMU) SELECT 1;
+ERROR:  42601
+-- spec: explain-pmu/Loaded later
+LOAD 'pg_pmu';
+ERROR:  55000
+\set VERBOSITY default
+-- A failed initialization is not kept, so a second LOAD fails the same.
+LOAD 'pg_pmu';
+ERROR:  pg_pmu must be loaded with shared_preload_libraries
