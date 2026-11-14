@@ -32,10 +32,15 @@ EXPLAIN (ANALYZE, PMU, COSTS off, TIMING off, SUMMARY off)
 ERROR:  0A000
 \set VERBOSITY default
 -- spec: explain-pmu/A caught failure of a worker
-EXPLAIN (ANALYZE, PMU, COSTS off, TIMING off, SUMMARY off)
-  SELECT caught();
-ERROR:  a parallel worker of the statement could not count
-DETAIL:  A function caught the error of the worker.
+DO $$
+BEGIN
+  EXECUTE 'EXPLAIN (ANALYZE, PMU) SELECT caught()';
+EXCEPTION
+  WHEN OTHERS THEN
+    RAISE NOTICE '%: %', SQLSTATE, SQLERRM;
+END
+$$;
+NOTICE:  0A000: a parallel worker of the statement could not count
 -- The next statement counts again.
 DO $$
 DECLARE

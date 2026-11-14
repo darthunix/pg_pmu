@@ -31,8 +31,14 @@ EXPLAIN (ANALYZE, PMU, COSTS off, TIMING off, SUMMARY off)
 \set VERBOSITY default
 
 -- spec: explain-pmu/A caught failure of a worker
-EXPLAIN (ANALYZE, PMU, COSTS off, TIMING off, SUMMARY off)
-  SELECT caught();
+DO $$
+BEGIN
+  EXECUTE 'EXPLAIN (ANALYZE, PMU) SELECT caught()';
+EXCEPTION
+  WHEN OTHERS THEN
+    RAISE NOTICE '%: %', SQLSTATE, SQLERRM;
+END
+$$;
 
 -- The next statement counts again.
 DO $$

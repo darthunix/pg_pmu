@@ -97,8 +97,9 @@ installcheck-counted: installcheck
 # the system's functions may be undefined.
 .PHONY: check-crate
 check-crate: $(RUST_LIB)
-	cd $(CRATE) && $(CARGO) fmt --check && $(CARGO) clippy --release \
-		&& $(CARGO) clippy --all-targets && $(CARGO) test
+	cd $(CRATE) && $(CARGO) fmt --check \
+		&& $(CARGO) clippy --release -- -D warnings \
+		&& $(CARGO) clippy --all-targets -- -D warnings && $(CARGO) test
 	@nm -u $(RUST_LIB) 2>/dev/null | awk \
 		'/^[^ \t].*\.o\)?:$$/ { crate = ($$0 ~ /pg_pmu_core/); seen += crate } \
 		 crate && $$NF ~ /^_?(_R[A-Za-z0-9]|_ZN|rust_eh_personality|_Unwind_)/ { print; bad = 1 } \
