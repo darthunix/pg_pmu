@@ -28,6 +28,7 @@
 #include "tcop/utility.h"
 #include "utils/guc.h"
 
+#include "pg_pmu.h"
 #include "pg_pmu_core.h"
 
 PG_MODULE_MAGIC_EXT(.name = "pg_pmu",.version = "0.1.0");
@@ -65,6 +66,8 @@ typedef struct PmuFrame
 	int			depth;			/* the depth of its EXPLAIN */
 	bool		counting;		/* the option PMU is on */
 	bool		referenced;		/* it holds a reference to the counters */
+	PmuHold    *hold;			/* the cell of its workers, if any */
+	int			guc_level;		/* where its setting pg_pmu.cell is saved */
 	MemoryContext cxt;			/* where its records live */
 	PmuRecord  *records;		/* the newest first */
 } PmuFrame;
@@ -116,9 +119,6 @@ static int	pmu_depth = 0;
 		} \
 	} while (0)
 
-/* pg_pmu.max_nested: nested counting statements the server runs at once */
-static int	pmu_max_nested = 16;
-
 /* Our slot in the extension state of an EXPLAIN. */
 static int	pmu_extension_id;
 
@@ -134,7 +134,6 @@ static ExecutorRun_hook_type prev_ExecutorRun = NULL;
 static ExecutorFinish_hook_type prev_ExecutorFinish = NULL;
 static ExecutorEnd_hook_type prev_ExecutorEnd = NULL;
 
-pg_noreturn static void pmu_report(int32 status, int32 os_error);
 static void pmu_release_descriptors(uint32 n);
 static void pmu_open_counters(void);
 static PmuExplainState *pmu_ensure_state(ExplainState *es);
@@ -184,6 +183,7 @@ _PG_init(void)
 		ereport(ERROR,
 				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
 				 errmsg("pg_pmu must be loaded with shared_preload_libraries")));
+	pmu_workers_init();
 
 	/*
 	 * The header written by hand must match the crate, and on Linux the
@@ -192,15 +192,6 @@ _PG_init(void)
 	pmu_check_layout();
 	pmu_check_perf_abi();
 
-	DefineCustomIntVariable("pg_pmu.max_nested",
-							"Nested counting statements the server can run at once.",
-							"A counting EXPLAIN that starts while another one of "
-							"the same backend runs takes one of them.",
-							&pmu_max_nested,
-							16, 0, 1024,
-							PGC_POSTMASTER,
-							0,
-							NULL, NULL, NULL);
 	MarkGUCPrefixReserved("pg_pmu");
 
 	pmu_extension_id = GetExplainExtensionId("pg_pmu");
@@ -317,6 +308,9 @@ pmu_validate_options(ExplainState *es, List *options, ParseState *pstate)
 	pmu_frames->referenced = true;
 	pmu_frames->counting = true;
 	state->frame = pmu_frames;
+
+	/* The cell of its workers; none left in the pool fails it here. */
+	pmu_frames->hold = pmu_take_cell(&pmu_frames->guc_level);
 }
 
 /*
@@ -375,13 +369,19 @@ pmu_ProcessUtility(PlannedStmt *pstmt, const char *queryString,
 }
 
 /*
- * Take a frame off the stack and give back its reference. On the way
- * out of an error nothing more is raised.
+ * Take a frame off the stack and give back its reference and, at the
+ * normal end, its cell. On the way out of an error nothing more is
+ * raised, and the cell goes back in the abort that follows, when
+ * PostgreSQL has waited for the workers.
  */
 static void
 pmu_frame_pop(PmuFrame *frame, bool report)
 {
 	bool		referenced = frame->referenced;
+	PmuHold    *hold = frame->hold;
+	int			guc_level = frame->guc_level;
+	int32		os_error = 0;
+	int32		status = PMU_OK;
 
 	Assert(pmu_frames == frame);
 	pmu_frames = frame->prev;
@@ -389,13 +389,13 @@ pmu_frame_pop(PmuFrame *frame, bool report)
 	pfree(frame);
 
 	if (referenced)
-	{
-		int32		os_error = 0;
-		int32		status = pmu_counters_release(&os_error);
-
-		if (status != PMU_OK && report)
-			pmu_report(status, os_error);
-	}
+		status = pmu_counters_release(&os_error);
+	if (!report)
+		return;
+	if (hold != NULL)
+		pmu_return_cell(hold, guc_level);
+	if (status != PMU_OK)
+		pmu_report(status, os_error);
 }
 
 static void
@@ -663,7 +663,7 @@ pmu_release_descriptors(uint32 n)
 /*
  * Turn a code of the crate into an error of PostgreSQL.
  */
-static void
+void
 pmu_report(int32 status, int32 os_error)
 {
 	errno = os_error;

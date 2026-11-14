@@ -10,7 +10,7 @@
 # started with pg_pmu.conf.
 
 MODULE_big = pg_pmu
-OBJS = pg_pmu.o test/abi.o
+OBJS = pg_pmu.o workers.o test/abi.o
 PGFILEDESC = "pg_pmu - counts of the processor in EXPLAIN ANALYZE"
 
 # The Rust crate, linked in as a static library. PG_PMU_COUNTERS=none
