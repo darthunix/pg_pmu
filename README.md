@@ -20,8 +20,10 @@ two plans, two settings, two executors. How the module works is in
 
 - Counts for one statement, parallel workers included, in EXPLAIN's
   output.
-- A small constant cost: a few reads of the counters per statement,
-  whatever the number of rows; no counter is read without the option.
+- A small cost: a few reads of the counters per statement and
+  process, whatever the number of rows. No counter is read without the
+  option; while an EXPLAIN runs, the hooks add a little bookkeeping to
+  each query it runs, which a counting statement counts too.
 - Nothing to create in the database, and shared memory of a size fixed
   at start, about 5 KB with default settings.
 - A count is right or the statement fails. Never a plausible wrong
@@ -63,6 +65,9 @@ EXPLAIN (ANALYZE, PMU, FORMAT JSON) SELECT ...;
 ```
 
 - `PMU` needs `ANALYZE`. The counts are printed after the plan.
+- It works only in an `EXPLAIN` statement: auto_explain, whose plans
+  have already run, and code that explains plans on its own cannot use
+  it.
 - JSON and YAML have the properties "Execution Instructions",
   "Execution Cycles", "Planning ..." and "Workers ...". XML has the
   same names with hyphens.
@@ -130,6 +135,9 @@ cases that need a machine of their own:
   `PG_PMU_TEST=workers-cannot-count`, whose workers fail to open their
   counters; build and install again without it afterwards;
 - `PG_PMU_COUNTERS=none` builds a module that cannot count.
+
+Give `make install` the same `PG_PMU_COUNTERS` and `PG_PMU_TEST` as
+`make`; otherwise it stops.
 
 ## License
 
