@@ -427,10 +427,14 @@ asks it to open, take, give back and read.
 `libc` has the system call but not the structure `perf_event_attr` or
 the constants of perf events, so the crate declares the few it uses.
 A wrong offset or bit there would count something else without a
-sign, so a C file of the suite includes `<linux/perf_event.h>` beside
-`pg_pmu_core.h` and checks at compile time the size of the structure,
-the offsets and bits the crate sets, and the values of the constants
-and of the requests of `ioctl`.
+sign, so a C file of the module includes `<linux/perf_event.h>` beside
+`pg_pmu_core.h` and, when the module loads, compares with it what the
+crate reports it uses: the size of the structure, its offsets, the
+word of bit fields the crate sets, and the values of the constants and
+of the requests of `ioctl`. A mismatch stops the server's start. The
+check runs at load rather than at compile time because bit fields
+have no offsets in C; a structure is filled with them and its word
+compared.
 
 On a processor with several kinds of cores each kind has its own unit
 in `/sys/bus/event_source/devices`, with a file `cpus` that lists its
@@ -600,11 +604,17 @@ short reads. In Rust these tools reach them:
   every string of up to 20 bytes, is read back to the same number or
   refused; each step, for every state word, leads from a state the
   spec allows to another one it allows, or refuses, with the
-  generation wrapping modulo 2^44; the parser of a list of processors,
-  for every input of up to 64 bytes, never panics or overflows; the
-  check of a read, for every buffer of up to 64 bytes, accepts exactly
-  a read of the right length with the right number of events. The
-  loops are unwound to those bounds with the checks of unwinding on.
+  generation wrapping modulo 2^44; a number of a list of processors,
+  for every input of up to 12 bytes, is read without overflow and only
+  when it is digits; the parser of a whole list, for every input of up
+  to 8 bytes into a set of 128 processors, never panics, the code being
+  the same for every size of set; adding a range, for every pair of
+  numbers, adds exactly the processors between them; the check of a
+  read, for every buffer of up to 64 bytes, accepts exactly a read of
+  the right length with the right number of events. The loops are
+  unwound to those bounds with the checks of unwinding on. The proof of
+  the parser takes about twelve minutes; longer lists are left to
+  proptest.
   Kani does not model system calls, sysfs or other threads; the steps
   are proved one at a time, as sequential code, and loom covers their
   interleavings;
@@ -719,22 +729,26 @@ system calls for that are few, and `libc` has the call itself.
   `PG_PMU_COUNTERS=none` builds the crate with the feature `none`, the
   version that cannot count.
 - `crates/pg_pmu_core/`: the crate. `src/cells.rs`: the layout, the
-  token and the steps; `src/counters/linux.rs`, `macos.rs`, `none.rs`:
-  the counters of each system; `src/sysfs.rs`: the kinds of cores and
-  their coverage; the proofs of Kani beside the code they prove;
-  `src/perf_abi.rs`: the few declarations of Linux's perf events;
-  `tests/model.rs`: the tests of proptest against the plain models;
-  `tests/loom.rs`: the models of loom; `tests/counters.rs`: the tests
-  on real counters; `Cargo.lock`.
+  token and the steps. `src/counters/mod.rs`: the references;
+  `perf.rs`: the groups of perf events over the calls of the system;
+  `linux.rs`: those calls on Linux; `perf_abi.rs`: the few
+  declarations of Linux's perf events; `macos.rs`, `none.rs`: the
+  other systems. `src/sysfs.rs`: the kinds of cores and their
+  coverage. `src/ffi.rs`: the functions C calls. The proofs of Kani
+  are beside the code they prove. `tests/model.rs`: the tests of
+  proptest against the plain models; `tests/loom.rs`: the models of
+  loom; `tests/counters.rs`: the tests on real counters; `tests/abi.rs`:
+  the codes of the header against the crate's; `Cargo.lock`.
 - `pg_pmu_core.h`: the C declarations of the crate's functions.
 - `pg_pmu.c`: the option, the hooks, the frames, the depth, the
   records, the output, the errors of the counters.
 - `workers.c`: the request of the shared memory, the setting
   `pg_pmu.cell`, the holds of cells, and the counting in the workers,
   all through the crate.
-- `test/abi.c`: the C file of the suite that includes
-  `pg_pmu_core.h`, calls it, and on Linux checks `src/perf_abi.rs`
-  against `<linux/perf_event.h>` at compile time.
+- `test/abi.c`: the C file of the module that includes
+  `pg_pmu_core.h`, compares its types with the crate's, and on Linux
+  compares `src/counters/perf_abi.rs` with `<linux/perf_event.h>`,
+  when the module loads.
 - `pg_pmu.conf`: the settings of the temporary server of the suite.
 - `sql/`, `expected/`: the regression suite.
 - `README.md`: loading, use, what the counts mean on each system.

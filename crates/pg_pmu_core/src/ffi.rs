@@ -8,7 +8,7 @@ use core::cell::UnsafeCell;
 use core::ffi::{CStr, c_char};
 use core::mem::{offset_of, size_of};
 
-use crate::counters::{Counters, Counts, Platform};
+use crate::counters::{Counters, Counts, Platform, platform};
 use crate::{Error, Status};
 
 /// The counters of this process.
@@ -19,7 +19,7 @@ struct ProcessCounters(UnsafeCell<Counters<Platform>>);
 // two calls run at once, and none calls back into another.
 unsafe impl Sync for ProcessCounters {}
 
-static COUNTERS: ProcessCounters = ProcessCounters(UnsafeCell::new(Counters::new(Platform::new())));
+static COUNTERS: ProcessCounters = ProcessCounters(UnsafeCell::new(Counters::new(platform())));
 
 /// Run `f` with the counters of this process. The reference lives only
 /// as long as `f`, and `f` does not call back into this module.
@@ -60,6 +60,7 @@ fn store(out: *mut Counts, counts: Counts) -> Result<(), Error> {
 pub struct PmuLayout {
     pub counts_size: u32,
     pub counts_cycles: u32,
+    pub perf_abi_size: u32,
 }
 
 /// Fill the layout of the shared types.
@@ -75,9 +76,65 @@ pub unsafe extern "C" fn pmu_core_layout(out: *mut PmuLayout) {
     let layout = PmuLayout {
         counts_size: size_of::<Counts>() as u32,
         counts_cycles: offset_of!(Counts, cycles) as u32,
+        perf_abi_size: size_of::<PmuPerfAbi>() as u32,
     };
     // SAFETY: see above.
     unsafe { out.write(layout) };
+}
+
+/// `PmuPerfAbi` of `pg_pmu_core.h`: what the crate puts in a
+/// `perf_event_attr` and passes to the kernel, so that C can compare it
+/// with `<linux/perf_event.h>` when the module loads on Linux.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct PmuPerfAbi {
+    pub attr_size: u32,
+    pub config_offset: u32,
+    pub read_format_offset: u32,
+    pub flags_offset: u32,
+    pub type_hardware: u32,
+    pub pmu_type_shift: u32,
+    pub hw_instructions: u64,
+    pub hw_cycles: u64,
+    pub format_group: u64,
+    pub leader_flags: u64,
+    pub member_flags: u64,
+    pub flag_fd_cloexec: u64,
+    pub ioc_enable: u64,
+    pub ioc_disable: u64,
+    pub ioc_flag_group: u64,
+}
+
+/// Fill what the crate uses of perf events.
+///
+/// # Safety
+///
+/// `out` is the address of a `PmuPerfAbi`, or null, which does nothing.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn pmu_core_perf_abi(out: *mut PmuPerfAbi) {
+    use crate::counters::perf_abi as abi;
+    if out.is_null() {
+        return;
+    }
+    let values = PmuPerfAbi {
+        attr_size: abi::PERF_ATTR_SIZE_VER0,
+        config_offset: offset_of!(abi::PerfEventAttr, config) as u32,
+        read_format_offset: offset_of!(abi::PerfEventAttr, read_format) as u32,
+        flags_offset: offset_of!(abi::PerfEventAttr, flags) as u32,
+        type_hardware: abi::PERF_TYPE_HARDWARE,
+        pmu_type_shift: abi::PERF_PMU_TYPE_SHIFT,
+        hw_instructions: abi::PERF_COUNT_HW_INSTRUCTIONS,
+        hw_cycles: abi::PERF_COUNT_HW_CPU_CYCLES,
+        format_group: abi::PERF_FORMAT_GROUP,
+        leader_flags: abi::LEADER_FLAGS,
+        member_flags: abi::MEMBER_FLAGS,
+        flag_fd_cloexec: abi::PERF_FLAG_FD_CLOEXEC,
+        ioc_enable: abi::PERF_EVENT_IOC_ENABLE,
+        ioc_disable: abi::PERF_EVENT_IOC_DISABLE,
+        ioc_flag_group: abi::PERF_IOC_FLAG_GROUP,
+    };
+    // SAFETY: see above.
+    unsafe { out.write(values) };
 }
 
 /// Find what must be opened, and write how many file descriptors the

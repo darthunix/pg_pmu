@@ -7,10 +7,17 @@
 //! counters are enabled while at least one is held, and the values
 //! only grow while they are enabled.
 
+#[cfg(all(target_os = "linux", not(feature = "none")))]
+mod linux;
 #[cfg(all(target_os = "macos", not(feature = "none")))]
 mod macos;
+pub mod perf;
+pub mod perf_abi;
 // Unused where the system counts, but always built so that it stays right.
-#[cfg_attr(all(target_os = "macos", not(feature = "none")), allow(dead_code))]
+#[cfg_attr(
+    all(any(target_os = "linux", target_os = "macos"), not(feature = "none")),
+    allow(dead_code)
+)]
 mod none;
 
 use core::ffi::CStr;
@@ -45,11 +52,30 @@ pub trait Backend {
 }
 
 /// The backend of this build.
+#[cfg(all(target_os = "linux", not(feature = "none")))]
+pub type Platform = perf::Perf<linux::LinuxSys>;
+/// The backend of this build.
 #[cfg(all(target_os = "macos", not(feature = "none")))]
 pub type Platform = macos::Rusage;
 /// The backend of this build.
-#[cfg(not(all(target_os = "macos", not(feature = "none"))))]
+#[cfg(not(all(any(target_os = "linux", target_os = "macos"), not(feature = "none"))))]
 pub type Platform = none::Unsupported;
+
+/// Make the backend of this build.
+pub const fn platform() -> Platform {
+    #[cfg(all(target_os = "linux", not(feature = "none")))]
+    {
+        perf::Perf::with(linux::LinuxSys::new())
+    }
+    #[cfg(all(target_os = "macos", not(feature = "none")))]
+    {
+        macos::Rusage::new()
+    }
+    #[cfg(not(all(any(target_os = "linux", target_os = "macos"), not(feature = "none"))))]
+    {
+        none::Unsupported::new()
+    }
+}
 
 /// The counters of one process and the references to them.
 pub struct Counters<B> {
@@ -80,6 +106,11 @@ impl<B: Backend> Counters<B> {
     /// The backend, for the tests.
     pub fn backend(&self) -> &B {
         &self.backend
+    }
+
+    /// The backend, for the tests.
+    pub fn backend_mut(&mut self) -> &mut B {
+        &mut self.backend
     }
 
     /// How many file descriptors the opening needs: 0 once open.

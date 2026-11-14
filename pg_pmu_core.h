@@ -45,9 +45,36 @@ typedef struct PmuLayout
 {
 	uint32_t	counts_size;
 	uint32_t	counts_cycles;
+	uint32_t	perf_abi_size;
 } PmuLayout;
 
 extern void pmu_core_layout(PmuLayout *out);
+
+/*
+ * What the crate puts in a struct perf_event_attr and passes to the
+ * kernel; on Linux the module compares it with <linux/perf_event.h>
+ * when it loads. The flags are the word of bit fields of the structure.
+ */
+typedef struct PmuPerfAbi
+{
+	uint32_t	attr_size;
+	uint32_t	config_offset;
+	uint32_t	read_format_offset;
+	uint32_t	flags_offset;
+	uint32_t	type_hardware;
+	uint32_t	pmu_type_shift;
+	uint64_t	hw_instructions;
+	uint64_t	hw_cycles;
+	uint64_t	format_group;
+	uint64_t	leader_flags;
+	uint64_t	member_flags;
+	uint64_t	flag_fd_cloexec;
+	uint64_t	ioc_enable;
+	uint64_t	ioc_disable;
+	uint64_t	ioc_flag_group;
+} PmuPerfAbi;
+
+extern void pmu_core_perf_abi(PmuPerfAbi *out);
 
 /*
  * The counters of this process. Plan, take the descriptors it asks

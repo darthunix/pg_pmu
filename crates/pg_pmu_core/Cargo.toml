@@ -22,6 +22,7 @@ libc = { version = "0.2", default-features = false }
 [dev-dependencies]
 # The tests build the crate with the standard library.
 pg_pmu_core = { path = ".", features = ["std"] }
+proptest = "1"
 
 [profile.dev]
 panic = "abort"

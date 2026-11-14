@@ -1,0 +1,550 @@
+//! The crate against plain models, with random cases from proptest:
+//! the rule of the kinds of cores over random machines in sysfs, the
+//! references to the counters, and the groups of perf events over a
+//! system that fails where the case says.
+
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing,
+    clippy::arithmetic_side_effects
+)]
+
+use std::collections::{BTreeSet, HashMap};
+
+use proptest::prelude::*;
+
+use pg_pmu_core::counters::perf::{Perf, PerfSys, open_error};
+use pg_pmu_core::counters::perf_abi::{
+    LEADER_FLAGS, MEMBER_FLAGS, PERF_EVENT_IOC_DISABLE, PERF_EVENT_IOC_ENABLE, PerfEventAttr,
+};
+use pg_pmu_core::counters::{Backend, Counters, Counts};
+use pg_pmu_core::sysfs::{self, Fs, MAX_KINDS, Malformed, Plan};
+use pg_pmu_core::{Error, Status};
+
+// ---------------------------------------------------------------------
+// The kinds of cores
+// ---------------------------------------------------------------------
+
+/// A sysfs in memory.
+#[derive(Default, Debug)]
+struct MemFs {
+    files: HashMap<Vec<u8>, Vec<u8>>,
+    dirs: HashMap<Vec<u8>, Vec<Vec<u8>>>,
+}
+
+impl Fs for MemFs {
+    fn read(&self, path: &[u8], buf: &mut [u8]) -> Result<usize, Malformed> {
+        let file = self.files.get(path).ok_or(Malformed)?;
+        if file.len() >= buf.len() {
+            return Err(Malformed);
+        }
+        buf[..file.len()].copy_from_slice(file);
+        Ok(file.len())
+    }
+
+    fn list(&self, dir: &[u8], each: &mut dyn FnMut(&[u8])) -> Result<(), Malformed> {
+        for name in self.dirs.get(dir).ok_or(Malformed)? {
+            each(name);
+        }
+        Ok(())
+    }
+}
+
+/// A unit of a kind of cores.
+#[derive(Clone, Debug)]
+struct Unit {
+    cpus: BTreeSet<u32>,
+    /// None: the file type cannot be read.
+    unit_type: Option<u32>,
+}
+
+#[derive(Clone, Debug)]
+struct Machine {
+    online: BTreeSet<u32>,
+    units: Vec<Unit>,
+    online_readable: bool,
+    listable: bool,
+    uniform: Option<bool>,
+    /// How each list is cut into ranges: a seed for each.
+    cuts: Vec<u64>,
+    newline: bool,
+}
+
+/// Write a set of processors as the kernel does, in ranges, cut in more
+/// pieces where the seed says.
+fn render(set: &BTreeSet<u32>, seed: u64, newline: bool) -> Vec<u8> {
+    let mut ranges: Vec<(u32, u32)> = Vec::new();
+    let mut s = seed;
+    for &c in set {
+        s = s
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        match ranges.last_mut() {
+            Some((_, last)) if *last + 1 == c && s >> 62 != 0 => *last = c,
+            _ => ranges.push((c, c)),
+        }
+    }
+    let mut text = ranges
+        .iter()
+        .map(|&(a, b)| {
+            if a == b {
+                format!("{a}")
+            } else {
+                format!("{a}-{b}")
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+    if newline {
+        text.push('\n');
+    }
+    text.into_bytes()
+}
+
+fn machine() -> impl Strategy<Value = Machine> {
+    (
+        prop::collection::btree_set(0u32..96, 1..40),
+        0usize..=MAX_KINDS + 1,
+        any::<u64>(),
+        prop::bool::weighted(0.95),
+        prop::bool::weighted(0.95),
+        prop::option::of(any::<bool>()),
+        any::<bool>(),
+    )
+        .prop_flat_map(
+            |(online, kinds, seed, online_readable, listable, uniform, newline)| {
+                let n = online.len();
+                (
+                    Just(online),
+                    // The kind of each online processor; kinds means none.
+                    prop::collection::vec(0..=kinds, n),
+                    prop::collection::vec(prop::option::weighted(0.9, 1u32..64), kinds),
+                    // Processors offline that a unit lists too.
+                    prop::collection::vec(prop::collection::btree_set(96u32..128, 0..3), kinds),
+                    Just((seed, online_readable, listable, uniform, newline, kinds)),
+                )
+            },
+        )
+        .prop_map(
+            |(
+                online,
+                owner,
+                types,
+                extra,
+                (seed, online_readable, listable, uniform, newline, kinds),
+            )| {
+                let mut units: Vec<Unit> = (0..kinds)
+                    .map(|k| Unit {
+                        cpus: extra[k].clone(),
+                        unit_type: types[k],
+                    })
+                    .collect();
+                for (&cpu, &k) in online.iter().zip(owner.iter()) {
+                    if k < kinds {
+                        units[k].cpus.insert(cpu);
+                    }
+                }
+                Machine {
+                    online,
+                    units,
+                    online_readable,
+                    listable,
+                    uniform,
+                    cuts: (0..=kinds as u64)
+                        .map(|i| seed ^ i.wrapping_mul(0x9e3779b97f4a7c15))
+                        .collect(),
+                    newline,
+                }
+            },
+        )
+}
+
+const DEVICES: &[u8] = b"bus/event_source/devices";
+
+fn sysfs_of(m: &Machine) -> MemFs {
+    let mut fs = MemFs::default();
+    // Units that are not kinds of cores, which have no file cpus.
+    let mut names: Vec<Vec<u8>> = vec![b"software".to_vec(), b"tracepoint".to_vec()];
+    for (k, unit) in m.units.iter().enumerate() {
+        let name = format!("cpu_kind{k}").into_bytes();
+        let path = |file: &str| [DEVICES, b"/", &name, b"/", file.as_bytes()].concat();
+        fs.files
+            .insert(path("cpus"), render(&unit.cpus, m.cuts[k], m.newline));
+        if let Some(t) = unit.unit_type {
+            fs.files.insert(path("type"), format!("{t}\n").into_bytes());
+        }
+        names.push(name);
+    }
+    if m.listable {
+        fs.dirs.insert(DEVICES.to_vec(), names);
+    }
+    if m.online_readable {
+        fs.files.insert(
+            b"devices/system/cpu/online".to_vec(),
+            render(&m.online, *m.cuts.last().unwrap(), m.newline),
+        );
+    }
+    fs
+}
+
+/// The rule, written plainly.
+fn model(m: &Machine) -> Result<Plan, Status> {
+    let units: Vec<&Unit> = if m.listable {
+        m.units.iter().filter(|u| u.unit_type.is_some()).collect()
+    } else {
+        Vec::new()
+    };
+    if units.len() > MAX_KINDS {
+        return Err(Status::KindNotOpenable);
+    }
+    let mut plan = Plan {
+        typed: false,
+        count: 0,
+        types: [0; MAX_KINDS],
+    };
+    if units.is_empty() {
+        return match m.uniform {
+            Some(true) => Ok(Plan { count: 1, ..plan }),
+            Some(false) => Err(Status::CoresNotCovered),
+            None => Err(Status::NoCounters),
+        };
+    }
+    if !m.online_readable {
+        return Err(Status::CoresNotCovered);
+    }
+    let covered: BTreeSet<u32> = units.iter().flat_map(|u| u.cpus.iter().copied()).collect();
+    if !m.online.is_subset(&covered) {
+        return Err(Status::CoresNotCovered);
+    }
+    for (slot, u) in plan.types.iter_mut().zip(&units) {
+        *slot = u.unit_type.unwrap();
+    }
+    plan.typed = units.len() > 1;
+    plan.count = units.len();
+    Ok(plan)
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(2000))]
+
+    #[test]
+    fn kinds_of_cores_follow_the_rule(m in machine()) {
+        let fs = sysfs_of(&m);
+        prop_assert_eq!(sysfs::discover(&fs, m.uniform), model(&m), "{:?}", m);
+    }
+
+    #[test]
+    fn lists_of_processors_read_back(set in prop::collection::btree_set(0u32..8192, 0..64),
+                                     seed in any::<u64>(), newline in any::<bool>()) {
+        let text = render(&set, seed, newline);
+        let parsed = sysfs::parse_cpu_list::<128>(&text).unwrap();
+        let mut expected = sysfs::CpuSet::<128>::new();
+        for c in &set {
+            expected.insert_range(*c, *c).unwrap();
+        }
+        prop_assert_eq!(parsed, expected);
+    }
+
+    #[test]
+    fn broken_lists_are_refused(text in "[0-9,\\-a ]{0,12}") {
+        // What the kernel never writes: a valid list is digits, and
+        // ranges of two numbers in order, separated by single commas.
+        let valid = {
+            let t = text.trim_end();
+            t.is_empty() || t.split(',').all(|item| {
+                let ends: Vec<&str> = item.splitn(2, '-').collect();
+                ends.iter().all(|e| !e.is_empty() && e.bytes().all(|b| b.is_ascii_digit()))
+                    && ends.iter().all(|e| e.parse::<u32>().is_ok_and(|n| n < 8192))
+                    && (ends.len() == 1 || ends[0].parse::<u32>().unwrap() <= ends[1].parse::<u32>().unwrap())
+            })
+        };
+        prop_assert_eq!(sysfs::parse_cpu_list::<128>(text.as_bytes()).is_ok(), valid, "{:?}", text);
+    }
+}
+
+// ---------------------------------------------------------------------
+// The references
+// ---------------------------------------------------------------------
+
+/// A backend that fails a call when told, and counts while enabled.
+#[derive(Default)]
+struct Fake {
+    enabled: bool,
+    value: u64,
+    fail_next: bool,
+}
+
+impl Fake {
+    fn fail(&mut self) -> Result<(), Error> {
+        if std::mem::take(&mut self.fail_next) {
+            Err(Error::new(Status::CounterLost))
+        } else {
+            Ok(())
+        }
+    }
+}
+
+impl Backend for Fake {
+    fn plan(&mut self, _: &std::ffi::CStr) -> Result<u32, Error> {
+        Ok(0)
+    }
+    fn open(&mut self) -> Result<(), Error> {
+        Ok(())
+    }
+    fn enable(&mut self) -> Result<(), Error> {
+        self.fail()?;
+        self.enabled = true;
+        Ok(())
+    }
+    fn disable(&mut self) -> Result<(), Error> {
+        self.enabled = false;
+        Ok(())
+    }
+    fn read(&mut self) -> Result<Counts, Error> {
+        self.fail()?;
+        if self.enabled {
+            self.value += 1;
+        }
+        Ok(Counts {
+            instructions: self.value,
+            cycles: self.value,
+        })
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+enum Op {
+    Acquire { fail: bool },
+    Read { fail: bool },
+    Release,
+}
+
+fn op() -> impl Strategy<Value = Op> {
+    prop_oneof![
+        prop::bool::weighted(0.1).prop_map(|fail| Op::Acquire { fail }),
+        prop::bool::weighted(0.1).prop_map(|fail| Op::Read { fail }),
+        Just(Op::Release),
+    ]
+}
+
+proptest! {
+    #[test]
+    fn references_follow_the_model(ops in prop::collection::vec(op(), 0..64)) {
+        let mut c = Counters::new(Fake::default());
+        c.open().unwrap();
+        let mut refs = 0u32;
+        for op in ops {
+            match op {
+                Op::Acquire { fail } => {
+                    c_fail(&mut c, fail);
+                    let r = c.acquire();
+                    prop_assert_eq!(r.is_ok(), !fail);
+                    if r.is_ok() {
+                        refs += 1;
+                    }
+                }
+                Op::Read { fail } => {
+                    c_fail(&mut c, fail);
+                    let r = c.read();
+                    if refs == 0 {
+                        prop_assert_eq!(r.unwrap_err().status, Status::Internal);
+                        clear_fail(&mut c);
+                    } else {
+                        prop_assert_eq!(r.is_ok(), !fail);
+                    }
+                }
+                Op::Release => {
+                    let r = c.release();
+                    if refs == 0 {
+                        prop_assert_eq!(r.unwrap_err().status, Status::Internal);
+                    } else {
+                        prop_assert!(r.is_ok());
+                        refs -= 1;
+                    }
+                }
+            }
+            prop_assert_eq!(c.refs(), refs);
+            prop_assert_eq!(c.backend().enabled, refs > 0);
+        }
+    }
+}
+
+fn c_fail(c: &mut Counters<Fake>, fail: bool) {
+    c.backend_mut().fail_next = fail;
+}
+
+fn clear_fail(c: &mut Counters<Fake>) {
+    c.backend_mut().fail_next = false;
+}
+
+// ---------------------------------------------------------------------
+// The groups of perf events
+// ---------------------------------------------------------------------
+
+/// A system of perf events in memory, that fails one call when told.
+#[derive(Default, Debug)]
+struct FakeSys {
+    next_fd: i32,
+    open: BTreeSet<i32>,
+    /// The leaders of groups, which reads and ioctls address.
+    leaders: BTreeSet<i32>,
+    enabled: BTreeSet<i32>,
+    /// Fail the open with this index with this errno.
+    fail_open: Option<(usize, i32)>,
+    opens: usize,
+    /// Reads of an enabled leader give no bytes: no free counter.
+    error_state: bool,
+    flags_seen: Vec<u64>,
+}
+
+impl PerfSys for FakeSys {
+    fn open(&mut self, attr: &PerfEventAttr, group_fd: i32) -> Result<i32, i32> {
+        let index = self.opens;
+        self.opens += 1;
+        if let Some((i, e)) = self.fail_open
+            && i == index
+        {
+            return Err(e);
+        }
+        assert!(group_fd == -1 || self.leaders.contains(&group_fd));
+        self.flags_seen.push(attr.flags);
+        self.next_fd += 1;
+        let fd = self.next_fd + 100;
+        self.open.insert(fd);
+        if group_fd == -1 {
+            self.leaders.insert(fd);
+        }
+        Ok(fd)
+    }
+
+    fn ioctl(&mut self, fd: i32, request: u64, _: u64) -> Result<(), i32> {
+        assert!(self.leaders.contains(&fd));
+        match request {
+            PERF_EVENT_IOC_ENABLE => {
+                self.enabled.insert(fd);
+            }
+            PERF_EVENT_IOC_DISABLE => {
+                self.enabled.remove(&fd);
+            }
+            _ => panic!("ioctl {request:#x}"),
+        }
+        Ok(())
+    }
+
+    fn read(&mut self, fd: i32, buf: &mut [u8]) -> Result<usize, i32> {
+        assert!(self.leaders.contains(&fd));
+        if self.error_state && self.enabled.contains(&fd) {
+            return Ok(0);
+        }
+        let words = [2u64, 1000 + fd as u64, 2000 + fd as u64];
+        for (i, w) in words.iter().enumerate() {
+            buf[i * 8..i * 8 + 8].copy_from_slice(&w.to_ne_bytes());
+        }
+        Ok(24)
+    }
+
+    fn close(&mut self, fd: i32) {
+        assert!(self.open.remove(&fd), "closed twice: {fd}");
+        self.leaders.remove(&fd);
+        self.enabled.remove(&fd);
+    }
+
+    fn uniform_cores(&self) -> Option<bool> {
+        Some(true)
+    }
+}
+
+fn plan_of(count: usize, typed: bool) -> Plan {
+    Plan {
+        typed,
+        count,
+        types: [8, 9, 10, 11],
+    }
+}
+
+const ERRNOS: [i32; 8] = [
+    libc::EACCES,
+    libc::EPERM,
+    libc::ENOENT,
+    libc::EOPNOTSUPP,
+    libc::EINVAL,
+    libc::EMFILE,
+    libc::EBUSY,
+    libc::EIO,
+];
+
+proptest! {
+    #[test]
+    fn a_failed_opening_closes_what_it_opened(count in 1usize..=MAX_KINDS, typed in any::<bool>(),
+                                              at in 0usize..8, errno in prop::sample::select(&ERRNOS[..])) {
+        let typed = typed && count > 1;
+        let mut perf = Perf::with(FakeSys { fail_open: Some((at, errno)), ..FakeSys::default() });
+        prop_assert_eq!(perf.set_plan(plan_of(count, typed)), 2 * count as u32);
+        let r = perf.open();
+        if at < 2 * count {
+            prop_assert_eq!(r, Err(open_error(errno, typed)));
+            prop_assert!(perf.sys().open.is_empty(), "left open: {:?}", perf.sys().open);
+        } else {
+            prop_assert_eq!(r, Ok(()));
+            prop_assert_eq!(perf.sys().open.len(), 2 * count);
+            prop_assert!(perf.sys().enabled.is_empty(), "the check leaves them disabled");
+        }
+    }
+}
+
+#[test]
+fn a_next_opening_succeeds_after_a_failure() {
+    let mut perf = Perf::with(FakeSys {
+        fail_open: Some((3, libc::EMFILE)),
+        ..FakeSys::default()
+    });
+    perf.set_plan(plan_of(2, true));
+    assert_eq!(perf.open().unwrap_err().status, Status::NoDescriptor);
+    assert!(perf.sys().open.is_empty());
+    perf.sys_mut().fail_open = None;
+    perf.open().unwrap();
+    assert_eq!(perf.sys().open.len(), 4);
+}
+
+#[test]
+fn leaders_are_pinned_and_members_follow() {
+    let mut perf = Perf::with(FakeSys::default());
+    perf.set_plan(plan_of(2, true));
+    perf.open().unwrap();
+    assert_eq!(
+        perf.sys().flags_seen,
+        [LEADER_FLAGS, MEMBER_FLAGS, LEADER_FLAGS, MEMBER_FLAGS]
+    );
+}
+
+#[test]
+fn no_free_counter_at_opening_and_a_lost_one_later() {
+    let mut perf = Perf::with(FakeSys {
+        error_state: true,
+        ..FakeSys::default()
+    });
+    perf.set_plan(plan_of(1, false));
+    assert_eq!(perf.open().unwrap_err().status, Status::NoFreeCounter);
+    assert!(perf.sys().open.is_empty());
+
+    perf.sys_mut().error_state = false;
+    perf.open().unwrap();
+    perf.enable().unwrap();
+    perf.read().unwrap();
+    perf.sys_mut().error_state = true;
+    assert_eq!(perf.read().unwrap_err().status, Status::CounterLost);
+}
+
+#[test]
+fn groups_are_added() {
+    let mut perf = Perf::with(FakeSys::default());
+    perf.set_plan(plan_of(2, true));
+    perf.open().unwrap();
+    perf.enable().unwrap();
+    let c = perf.read().unwrap();
+    // The fake reads 1000 + fd and 2000 + fd for leaders 101 and 103.
+    assert_eq!(c.instructions, 1101 + 1103);
+    assert_eq!(c.cycles, 2101 + 2103);
+}

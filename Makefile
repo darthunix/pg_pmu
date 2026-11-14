@@ -44,6 +44,13 @@ PG_CONFIG ?= pg_config
 PGXS := $(shell $(PG_CONFIG) --pgxs)
 include $(PGXS)
 
+ifeq ($(PORTNAME),linux)
+# Keep the crate's symbols inside the module: PostgreSQL loads modules
+# with RTLD_GLOBAL, and another module written in Rust may define the
+# same ones.
+SHLIB_LINK += -Wl,--exclude-libs,libpg_pmu_core.a
+endif
+
 $(shlib): $(RUST_LIB)
 
 # A switch of the version removes the module while make reads this
