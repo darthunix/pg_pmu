@@ -1,6 +1,6 @@
 //! The parts of pg_pmu that are checked best in Rust: the counters of
-//! the processor for one process, and, later, the cells of the shared
-//! memory where the parallel workers report.
+//! the processor for one process, and the cells of the shared memory
+//! where the parallel workers report.
 //!
 //! The crate is linked into the C module as a static library. C calls
 //! the functions in [`ffi`], declared by hand in `pmu_counters.h`, and

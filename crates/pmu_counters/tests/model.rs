@@ -598,7 +598,7 @@ fn a_failed_enable_leaves_no_group_on() {
 }
 
 #[test]
-fn errors_of_opening_mean_what_the_spec_says() {
+fn errors_of_opening_mean_what_the_design_says() {
     let table = [
         (libc::EACCES, false, Status::NotPermitted),
         (libc::EPERM, true, Status::NotPermitted),

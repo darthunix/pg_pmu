@@ -3,8 +3,8 @@
 //! Each counting statement holds a cell: the outermost one of a backend
 //! its backend's own, a nested one a cell of the pool. The workers of the
 //! statement add their counts to it. The layout and the meaning of the
-//! states are in the spec; this module is the only code that reads or
-//! writes a cell.
+//! states are in doc/design.md; this module is the only code that reads
+//! or writes a cell.
 //!
 //! The state of a cell is one 64-bit word: the generation `G` in bits
 //! 20 to 63, odd while the cell is taken, and the number `W` of workers
@@ -33,7 +33,7 @@ pub const EMPTYING: u64 = LOW_MASK;
 /// The generation counts modulo 2^44.
 pub const G_MASK: u64 = (1 << (64 - LOW_BITS)) - 1;
 
-// The layout of the spec: G in bits 20 to 63, W in bits 0 to 19.
+// The layout of doc/design.md: G in bits 20 to 63, W in bits 0 to 19.
 const _: () = assert!(LOW_BITS == 20 && EMPTYING == 0xF_FFFF && G_MASK == 0xFFF_FFFF_FFFF);
 
 /// The header of the memory, written once when the server starts.
@@ -309,7 +309,7 @@ pub fn take_from_pool(pool: &[Cell]) -> Option<(usize, u64)> {
 mod proofs {
     use super::*;
 
-    /// The three states the spec allows, written with the numbers of the
+    /// The three states the design allows, written with the numbers of the
     /// spec rather than the code's constants: G in bits 20 to 63, W in
     /// bits 0 to 19, the mark of emptying all ones.
     fn allowed(s: u64) -> bool {
@@ -327,7 +327,7 @@ mod proofs {
     }
 
     /// Every token, for every number of cells up to 2^20 - 1, is valid
-    /// exactly as the spec says, and is made back from what it holds;
+    /// exactly as the design says, and is made back from what it holds;
     /// every cell and odd generation make a token that reads back.
     #[kani::proof]
     fn tokens_are_read_back() {
@@ -377,15 +377,15 @@ mod proofs {
         }
     }
 
-    /// Each step, from every state the spec allows, with every
-    /// generation and every sums, is taken exactly when the spec allows
-    /// it, makes the state the spec says and leads to an allowed one,
+    /// Each step, from every state the design allows, with every
+    /// generation and every sums, is taken exactly when the design allows
+    /// it, makes the state the design says and leads to an allowed one,
     /// returns what the cell holds where it returns anything, and leaves
     /// the sums as they were, but for emptying, which takes them and
     /// leaves zeros; a refused step changes nothing.
     #[kani::proof]
     #[kani::unwind(3)]
-    fn steps_keep_the_states_of_the_spec() {
+    fn steps_keep_the_states_of_the_design() {
         let s: u64 = kani::any();
         kani::assume(allowed(s));
         let g: u64 = kani::any();
@@ -467,7 +467,7 @@ mod tests {
     use core::mem::{offset_of, size_of};
 
     #[test]
-    fn layout_is_that_of_the_spec() {
+    fn layout_is_that_of_the_design() {
         assert_eq!(size_of::<Header>(), 16);
         assert_eq!(size_of::<Cell>(), 32);
         assert_eq!(offset_of!(Cell, instructions), 0);

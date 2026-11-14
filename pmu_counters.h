@@ -56,7 +56,7 @@ typedef struct PmuLayout
 	uint32_t	contents_failures;
 } PmuLayout;
 
-extern void pmu_core_layout(PmuLayout *out);
+extern void pmu_counters_layout(PmuLayout *out);
 
 /*
  * What the crate puts in a struct perf_event_attr and passes to the
@@ -82,7 +82,7 @@ typedef struct PmuPerfAbi
 	uint64_t	ioc_flag_group;
 } PmuPerfAbi;
 
-extern void pmu_core_perf_abi(PmuPerfAbi *out);
+extern void pmu_counters_perf_abi(PmuPerfAbi *out);
 
 /*
  * The counters of this process. Plan, take the descriptors it asks
@@ -100,7 +100,8 @@ extern int32_t pmu_counters_release(int32_t *os_error);
 
 /*
  * The cells of the memory "pg_pmu", where the parallel workers of a
- * counting statement report; the layout and the token are in the spec.
+ * counting statement report; the layout and the token are in
+ * doc/design.md.
  * The module allocates the memory and passes its address to each call.
  * These functions do not write os_error.
  */

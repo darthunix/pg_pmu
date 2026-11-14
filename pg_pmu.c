@@ -68,8 +68,8 @@ typedef struct PmuFrame
 {
 	struct PmuFrame *prev;
 	int			depth;			/* the depth of its EXPLAIN */
-	bool		counting;		/* the option PMU is on */
-	bool		referenced;		/* it holds a reference to the counters */
+	bool		counting;		/* the option PMU is on; it then holds a
+								 * reference to the counters */
 	PmuHold    *hold;			/* the cell of its workers, if any */
 	int			guc_level;		/* where its setting pg_pmu.cell is saved */
 	MemoryContext cxt;			/* where its records live */
@@ -308,7 +308,6 @@ pmu_validate_options(ExplainState *es, List *options, ParseState *pstate)
 		if (status != PMU_OK)
 			pmu_report(status, os_error);
 	}
-	pmu_frames->referenced = true;
 	pmu_frames->counting = true;
 	state->frame = pmu_frames;
 
@@ -380,7 +379,7 @@ pmu_ProcessUtility(PlannedStmt *pstmt, const char *queryString,
 static void
 pmu_frame_pop(PmuFrame *frame, bool report)
 {
-	bool		referenced = frame->referenced;
+	bool		referenced = frame->counting;
 	PmuHold    *hold = frame->hold;
 	int			guc_level = frame->guc_level;
 	int32		os_error = 0;
@@ -694,7 +693,7 @@ pmu_release_descriptors(uint32 n)
 	(os_error != 0 ? errdetail("The system said: %m.") : 0)
 
 /*
- * The SQLSTATE of a code of the crate, as the spec gives it.
+ * The SQLSTATE of a code of the crate, as the README lists it.
  */
 int
 pmu_status_sqlstate(int32 status)
@@ -769,7 +768,7 @@ pmu_report(int32 status, int32 os_error)
 					(errcode(pmu_status_sqlstate(status)),
 					 errmsg("the kernel cannot count on every kind of cores of this processor"),
 					 PMU_SYSTEM_DETAIL(),
-					 errhint("On Intel this needs Linux 5.13 or later.")));
+					 errhint("Counting on several kinds of cores needs Linux 5.13 or later on Intel, and a kernel with extended hardware types on Arm.")));
 			break;
 		case PMU_NO_FREE_COUNTER:
 			ereport(ERROR,

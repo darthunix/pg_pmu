@@ -205,10 +205,14 @@ pmu_take_cell(int *guc_level)
 	{
 		/* Only this backend takes its cell; taken means a fault. */
 		if (MyProcNumber < 0 || MyProcNumber >= MaxBackends)
-			status = PMU_INTERNAL;
-		else
-			status = pmu_cell_take(pmu_cells, (uint32) MyProcNumber,
-								   &hold->token);
+		{
+			pfree(hold);
+			ereport(ERROR,
+					(errcode(ERRCODE_INTERNAL_ERROR),
+					 errmsg("internal error of pg_pmu: this process has no cell")));
+		}
+		status = pmu_cell_take(pmu_cells, (uint32) MyProcNumber,
+							   &hold->token);
 		if (status != PMU_OK)
 		{
 			pfree(hold);
