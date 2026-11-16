@@ -6,7 +6,7 @@ for r in results/*.out output_unloaded/results/*.out; do
 	[ -f "$r" ] || continue
 	t=$(basename "$r" .out)
 	matched=none
-	for e in expected/"$t".out expected/"$t"_[0-9].out; do
+	for e in pg/expected/"$t".out pg/expected/"$t"_[0-9].out; do
 		if [ -f "$e" ] && cmp -s "$r" "$e"; then
 			matched=$(basename "$e")
 			break
