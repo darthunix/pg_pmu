@@ -13,6 +13,7 @@
 #include "executor/execdesc.h"
 
 #include "pmu_counters.h"
+#include "report.h"
 
 /*
  * A cell of the shared memory that a counting statement holds for its
@@ -21,9 +22,7 @@
  */
 typedef struct PmuHold PmuHold;
 
-/* In pg_pmu.c: the codes of the crate as errors, and the counters. */
-pg_noreturn extern void pmu_report(int32 status, int32 os_error);
-extern int	pmu_status_sqlstate(int32 status);
+/* In pg_pmu.c: the counters. */
 extern void pmu_open_counters(uint32 sets);
 
 /* In workers.c: the cells, and the counting in a worker. */

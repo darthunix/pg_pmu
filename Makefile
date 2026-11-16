@@ -13,7 +13,8 @@
 # started with pg/pg_pmu.conf.
 
 MODULE_big = pg_pmu
-OBJS = pg/pg_pmu.o pg/workers.o test/abi.o
+OBJS = pg/pg_pmu.o pg/workers.o common/report.o test/abi.o
+PG_CPPFLAGS += -I$(srcdir)/common
 PGFILEDESC = "pg_pmu - counts of the processor in EXPLAIN ANALYZE"
 
 # The Rust crate, linked in as a static library. PG_PMU_COUNTERS=none
