@@ -105,16 +105,19 @@ installcheck-counted: installcheck
 # Rust code outside it: no panic, which would abort the process of
 # PostgreSQL, and no function of core left out of line, which would
 # need a personality of unwinding that the archive does not have. Only
-# the system's functions may be undefined.
+# the system's functions may be undefined; a Rust function that one
+# object of the crate calls and another defines is the crate's own.
 .PHONY: check-crate
 check-crate: $(RUST_LIB)
 	cd $(CRATE) && $(CARGO) fmt --check \
 		&& $(CARGO) clippy --release -- -D warnings \
 		&& $(CARGO) clippy --all-targets -- -D warnings && $(CARGO) test
-	@nm -u $(RUST_LIB) 2>/dev/null | awk \
-		'/^[^ \t].*\.o\)?:$$/ { crate = ($$0 ~ /pmu_counters/); seen += crate } \
-		 crate && $$NF ~ /^_?(_R[A-Za-z0-9]|_ZN|rust_eh_personality|_Unwind_)/ { print; bad = 1 } \
+	@nm $(RUST_LIB) 2>/dev/null | awk \
+		'/^[^ \t].*\.o\)?:$$/ { crate = ($$0 ~ /pmu_counters/); seen += crate; next } \
+		 crate && $$NF ~ /^_?(_R[A-Za-z0-9]|_ZN|rust_eh_personality|_Unwind_)/ { \
+		       if ($$(NF-1) == "U") undefined[$$NF] = 1; else defined[$$NF] = 1 } \
 		 END { if (!seen) { print "pmu_counters: no code of the crate in the archive"; exit 1 } \
+		       for (s in undefined) if (!(s in defined)) { print s; bad = 1 } \
 		       if (bad) { print "pmu_counters: the crate calls Rust code outside it"; exit 1 } }'
 
 # Suites of systems that cannot count, which CI makes: Linux with
