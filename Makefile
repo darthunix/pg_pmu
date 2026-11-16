@@ -1,16 +1,19 @@
 # pg_pmu: counts of instructions and cycles of the processor in
 # EXPLAIN ANALYZE.
 #
+# The C code of the module for PostgreSQL, its suites and their settings
+# are in pg/; the Rust crate and the check of its header are shared.
+#
 # The suites need temporary servers:
 #
 #   make installcheck EXTRA_REGRESS_OPTS="--temp-instance=$PWD/tmp_check"
 #
 # The suite "unloaded" needs a server without the module, so it runs
 # first, on a temporary server of its own; the others run on one
-# started with pg_pmu.conf.
+# started with pg/pg_pmu.conf.
 
 MODULE_big = pg_pmu
-OBJS = pg_pmu.o workers.o test/abi.o
+OBJS = pg/pg_pmu.o pg/workers.o test/abi.o
 PGFILEDESC = "pg_pmu - counts of the processor in EXPLAIN ANALYZE"
 
 # The Rust crate, linked in as a static library. PG_PMU_COUNTERS=none
@@ -48,7 +51,7 @@ PMU_VARIANT = $(PMU_COUNTERS)$(if $(PG_PMU_TEST), $(PG_PMU_TEST))
 COUNTED_SUITES = counters
 
 REGRESS = option counters
-REGRESS_OPTS = --temp-config=$(srcdir)/pg_pmu.conf
+REGRESS_OPTS = --inputdir=$(srcdir)/pg --temp-config=$(srcdir)/pg/pg_pmu.conf
 
 PG_CONFIG ?= pg_config
 PGXS := $(shell $(PG_CONFIG) --pgxs)
@@ -78,7 +81,7 @@ $(error pg_pmu was built as "$(PMU_BUILT)"; give "make install" the PG_PMU_COUNT
 endif
 endif
 ifneq ($(if $(MAKECMDGOALS),$(filter all install,$(MAKECMDGOALS)),all),)
-$(shell echo $(PMU_VARIANT) > .pmu_variant; rm -f $(shlib) workers.o)
+$(shell echo $(PMU_VARIANT) > .pmu_variant; rm -f $(shlib) pg/workers.o)
 endif
 endif
 
@@ -96,7 +99,7 @@ installcheck: installcheck-unloaded
 .PHONY: installcheck-counted
 installcheck-counted: installcheck
 	@for t in $(COUNTED_SUITES); do \
-		cmp -s results/$$t.out $(srcdir)/expected/$$t.out || { \
+		cmp -s results/$$t.out $(srcdir)/pg/expected/$$t.out || { \
 			echo "pg_pmu: $$t matched the output of a system that cannot count"; \
 			exit 1; }; \
 	done
@@ -136,7 +139,7 @@ installcheck-workers-cannot-count:
 
 .PHONY: installcheck-unloaded
 installcheck-unloaded:
-	$(pg_regress_installcheck) \
+	$(pg_regress_installcheck) --inputdir=$(srcdir)/pg \
 		--temp-instance=$(CURDIR)/tmp_check_unloaded \
 		--outputdir=$(CURDIR)/output_unloaded \
 		unloaded

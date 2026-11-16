@@ -54,7 +54,7 @@ arrive through the cell, a slot of shared memory the backend owns for
 the statement. The worker part is included in `Execution PMU`, and
 `VERBOSE` shows it separately as `Workers PMU`.
 
-The code is in C (`pg_pmu.c`, `workers.c`) and in a Rust crate,
+The code is in C (`pg/pg_pmu.c`, `pg/workers.c`) and in a Rust crate,
 `crates/pmu_counters`; the section "Rust and C" says who does what.
 
 ## Counting one process
@@ -293,7 +293,7 @@ and the log says so.
 ## Rust and C
 
 ```
- C: pg_pmu.c, workers.c      hooks, frames, the setting, errors;
+ C: pg/*.c                   hooks, frames, the setting, errors;
                              allocates the shared memory and reserves
                              file descriptors from PostgreSQL's budget
         │ extern "C"
