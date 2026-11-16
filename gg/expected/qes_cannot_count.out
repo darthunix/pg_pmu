@@ -1,0 +1,52 @@
+-- With the build PG_PMU_TEST=qes-cannot-count no QE can count: each says
+-- so in its report, and the coordinator fails the statement with the
+-- code of the report.
+SET optimizer = off;
+CREATE TABLE uncounted (a int) DISTRIBUTED BY (a);
+INSERT INTO uncounted SELECT generate_series(1, 100);
+\set VERBOSITY sqlstate
+EXPLAIN (ANALYZE, PMU, COSTS off, TIMING off, SUMMARY off)
+SELECT count(*) FROM uncounted;
+ERROR:  0A000
+\set VERBOSITY default
+EXPLAIN (ANALYZE, PMU, COSTS off, TIMING off, SUMMARY off)
+SELECT count(*) FROM uncounted;
+ERROR:  a segment could not count the statement
+DETAIL:  On seg2: the system keeps no counters of instructions for the process.
+-- A function that catches the error of an EXPLAIN inside does not hide
+-- it: the counts of the inner statement's QEs are lost, and the
+-- statement fails.
+CREATE FUNCTION caught() RETURNS text
+LANGUAGE plpgsql AS $$
+BEGIN
+  EXECUTE 'EXPLAIN (ANALYZE, PMU) SELECT count(*) FROM uncounted';
+  RETURN 'not caught';
+EXCEPTION
+  WHEN OTHERS THEN
+    RETURN 'caught';
+END
+$$;
+SELECT caught();
+ caught 
+--------
+ caught
+(1 row)
+
+EXPLAIN (ANALYZE, PMU, COSTS off, TIMING off, SUMMARY off)
+SELECT caught();
+ERROR:  pg_pmu cannot count the whole statement
+DETAIL:  Its counts would be short: an EXPLAIN inside the statement failed, and the counts of its segments are lost.
+DROP FUNCTION caught();
+-- A statement without the option is not affected.
+EXPLAIN (ANALYZE, COSTS off, TIMING off, SUMMARY off)
+SELECT count(*) FROM uncounted;
+                               QUERY PLAN                               
+------------------------------------------------------------------------
+ Finalize Aggregate (actual rows=1 loops=1)
+   ->  Gather Motion 3:1  (slice1; segments: 3) (actual rows=3 loops=1)
+         ->  Partial Aggregate (actual rows=1 loops=1)
+               ->  Seq Scan on uncounted (actual rows=38 loops=1)
+ Optimizer: Postgres-based planner
+(5 rows)
+
+DROP TABLE uncounted;

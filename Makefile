@@ -1,19 +1,29 @@
 # pg_pmu: counts of instructions and cycles of the processor in
 # EXPLAIN ANALYZE.
 #
-# The C code of the module for PostgreSQL, its suites and their settings
-# are in pg/; the Rust crate and the check of its header are shared.
+# The C code of the module and its suites are in a directory for each
+# core: pg/ for PostgreSQL, gg/ for Greengage. make builds the one of
+# the core that pg_config names: only Greengage's knows --gp_version.
+# The Rust crate, common/ and the check of the crate's header are shared.
 #
-# The suites need temporary servers:
+# The suites of PostgreSQL need temporary servers:
 #
 #   make installcheck EXTRA_REGRESS_OPTS="--temp-instance=$PWD/tmp_check"
 #
 # The suite "unloaded" needs a server without the module, so it runs
 # first, on a temporary server of its own; the others run on one
-# started with pg/pg_pmu.conf.
+# started with pg/pg_pmu.conf. The suites of Greengage run against a
+# cluster, see gg/README.md.
+
+PG_CONFIG ?= pg_config
+PMU_CORE := $(if $(shell $(PG_CONFIG) --gp_version 2>/dev/null),gg,pg)
 
 MODULE_big = pg_pmu
+ifeq ($(PMU_CORE),gg)
+OBJS = gg/pg_pmu.o common/report.o test/abi.o
+else
 OBJS = pg/pg_pmu.o pg/workers.o common/report.o test/abi.o
+endif
 PG_CPPFLAGS += -I$(srcdir)/common
 PGFILEDESC = "pg_pmu - counts of the processor in EXPLAIN ANALYZE"
 
@@ -40,12 +50,18 @@ EXTRA_CLEAN = output_unloaded tmp_check_unloaded .pmu_variant
 # PG_PMU_TEST=workers-cannot-count builds a module whose parallel
 # workers fail to open their counters, for the suite
 # workers_cannot_count, which runs only on a machine that counts.
-ifeq ($(PG_PMU_TEST),workers-cannot-count)
+# On Greengage, PG_PMU_TEST=qes-cannot-count builds a module whose QEs
+# cannot count, for the suite qes_cannot_count.
+ifeq ($(PMU_CORE)$(PG_PMU_TEST),pgworkers-cannot-count)
 PG_CPPFLAGS += -DPMU_TEST_WORKERS_CANNOT_COUNT
+else ifeq ($(PMU_CORE)$(PG_PMU_TEST),ggqes-cannot-count)
+PG_CPPFLAGS += -DPMU_TEST_QES_CANNOT_COUNT
 else ifneq ($(PG_PMU_TEST),)
-$(error PG_PMU_TEST is workers-cannot-count or empty)
+$(error PG_PMU_TEST is workers-cannot-count on PostgreSQL, qes-cannot-count on Greengage, or empty)
 endif
-PMU_VARIANT = $(PMU_COUNTERS)$(if $(PG_PMU_TEST), $(PG_PMU_TEST))
+# What the module is built as: the counters, the test, and the core, so
+# that objects of another core or release are never linked.
+PMU_VARIANT = $(PMU_COUNTERS)$(if $(PG_PMU_TEST), $(PG_PMU_TEST)) $(PMU_CORE) $(shell $(PG_CONFIG) --version) $(shell $(PG_CONFIG) --gp_version 2>/dev/null)
 
 # The suites with a second expected output for a system that cannot
 # count; "make installcheck-counted" demands the first. The suites of
@@ -53,14 +69,18 @@ PMU_VARIANT = $(PMU_COUNTERS)$(if $(PG_PMU_TEST), $(PG_PMU_TEST))
 # on a machine that counts them all at once: macOS never does, and
 # virtual machines may hide them.
 COUNTED_SUITES = counters
+
+ifeq ($(PMU_CORE),gg)
+REGRESS = setup counters teardown qes_unloaded
+REGRESS_OPTS = --inputdir=$(srcdir)/gg
+else
+REGRESS = option counters events_branches events_cache events_full
 ifneq ($(PG_PMU_REQUIRE_EVENTS),)
 COUNTED_SUITES += events_branches events_cache events_full
 endif
-
-REGRESS = option counters events_branches events_cache events_full
 REGRESS_OPTS = --inputdir=$(srcdir)/pg --temp-config=$(srcdir)/pg/pg_pmu.conf
+endif
 
-PG_CONFIG ?= pg_config
 PGXS := $(shell $(PG_CONFIG) --pgxs)
 include $(PGXS)
 
@@ -84,11 +104,11 @@ PMU_BUILT = $(shell cat .pmu_variant 2>/dev/null)
 ifneq ($(PMU_BUILT),$(PMU_VARIANT))
 ifneq ($(PMU_BUILT),)
 ifneq ($(filter install,$(MAKECMDGOALS)),)
-$(error pg_pmu was built as "$(PMU_BUILT)"; give "make install" the PG_PMU_COUNTERS and PG_PMU_TEST of "make")
+$(error pg_pmu was built as "$(PMU_BUILT)"; give "make install" the PG_CONFIG, PG_PMU_COUNTERS and PG_PMU_TEST of "make")
 endif
 endif
 ifneq ($(if $(MAKECMDGOALS),$(filter all install,$(MAKECMDGOALS)),all),)
-$(shell echo $(PMU_VARIANT) > .pmu_variant; rm -f $(shlib) pg/workers.o)
+$(shell echo '$(PMU_VARIANT)' > .pmu_variant; rm -f $(shlib) $(OBJS) $(OBJS:.o=.bc))
 endif
 endif
 
@@ -99,14 +119,16 @@ $(RUST_LIB): $(RUST_SOURCES)
 	$(CARGO) build $(CARGO_FLAGS)
 	touch $@
 
+ifeq ($(PMU_CORE),pg)
 installcheck: installcheck-unloaded
+endif
 
 # On a machine that must count: the suites, and then each of the
 # suites above must have matched its first expected output.
 .PHONY: installcheck-counted
 installcheck-counted: installcheck
 	@for t in $(COUNTED_SUITES); do \
-		cmp -s results/$$t.out $(srcdir)/pg/expected/$$t.out || { \
+		cmp -s results/$$t.out $(srcdir)/$(PMU_CORE)/expected/$$t.out || { \
 			echo "pg_pmu: $$t matched the output of a system that cannot count"; \
 			exit 1; }; \
 	done
@@ -130,6 +152,7 @@ check-crate: $(RUST_LIB)
 		       for (s in undefined) if (!(s in defined)) { print s; bad = 1 } \
 		       if (bad) { print "pmu_counters: the crate calls Rust code outside it"; exit 1 } }'
 
+ifeq ($(PMU_CORE),pg)
 # Suites of systems that cannot count, which CI makes: Linux with
 # kernel.perf_event_paranoid set to 4, and a virtual machine with macOS.
 .PHONY: installcheck-paranoid installcheck-vm
@@ -150,3 +173,10 @@ installcheck-unloaded:
 		--temp-instance=$(CURDIR)/tmp_check_unloaded \
 		--outputdir=$(CURDIR)/output_unloaded \
 		unloaded
+else
+# On Greengage, with the build PG_PMU_TEST=qes-cannot-count: the
+# statement fails when a QE cannot count.
+.PHONY: installcheck-qes-cannot-count
+installcheck-qes-cannot-count:
+	$(pg_regress_installcheck) $(REGRESS_OPTS) setup qes_cannot_count teardown
+endif

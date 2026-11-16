@@ -322,6 +322,70 @@ An ordinary error in a worker (division by zero, cancel) is not a
 failure to count: the worker reports what it counted from its exit
 callback.
 
+## Greengage
+
+A statement of Greengage runs on the coordinator (the QD) and, slice
+by slice, on the segments, where each slice has an executor (a QE) on
+each segment, in a process of its own. The QD counts its part as a
+backend of PostgreSQL does, with the same frames and records. A QE
+cannot write into the QD's memory, so its counts travel with the
+statistics of EXPLAIN ANALYZE that each QE sends at the end of its
+slice:
+
+```
+ QD                                      QE (each slice, each segment)
+ EXPLAIN (ANALYZE, PMU)
+   validate: open, take a reference
+ ExecutorStart: record, start counts     ExecutorStart: INSTRUMENT_CDB?
+   initplans dispatched ---------------->  start counting
+ ...                                     ExecutorEnd: read, give back
+   reports of initplans <---------------   statistics + "pg_pmu" piece
+ ExplainPrintPlan
+   reports of the main plan <-----------
+ per-plan hook: QD part + every report
+```
+
+A QE does not know whether the statement asked for PMU, so it counts
+every slice of an EXPLAIN ANALYZE and never raises an error of its
+own: a report says either the counts or why it could not count. The
+QD finds the record of a report by the statement's `showstatctx`,
+which EXPLAIN sets before `ExecutorStart`; the record exists by then,
+since the reports of initplans arrive during the start. The core
+passes each QE's message to the module before its pieces, so the QD
+knows which QEs sent statistics without a report, as when the module
+is not loaded on a segment. Under VERBOSE the reports are added up by
+slice. Planning is counted in `ExplainOneQuery_hook`, around
+`pg_plan_query`, since the planner hook of PostgreSQL 12 does not see
+the EXPLAIN.
+
+A statement inside a counting one, an EXPLAIN that a function runs,
+gives the reports of its QEs to the innermost counting frame, which adds
+them to its own as "Nested QEs": a counting inner EXPLAIN when it ends,
+one without PMU as the reports come. Each record keeps a copy of the
+frame's nested sums at its start and at its finish, as a record of
+PostgreSQL keeps the cell's, so that only what ran inside the plan
+counts in its execution; what the planner ran counts in the planning.
+The rule that a count is right or the statement fails then asks for
+three more failures, since the QD cannot get counts the QEs never sent:
+
+- a query inside the statement that runs on the segments outside an
+  EXPLAIN ANALYZE, whose QEs send no statistics; a query auto_explain
+  analyzes is outside, since auto_explain may never take its
+  statistics in;
+- an EXPLAIN inside that fails, even one a function catches, whose
+  QEs' counts are lost;
+- a QE whose statistics came without a report, or whose report says
+  it could not count.
+
+A QE's run lives in TopMemoryContext from the start of its executor to
+its end; the abort of its subtransaction or the end of the
+transaction frees one an error left behind, with its reference to the
+counters.
+
+Not seen: a utility statement that a function runs inside the
+statement sends its work to the segments outside the executor, where
+no hook of the module looks, and that work is not counted.
+
 ## Errors
 
 The backend opens its counters when EXPLAIN checks its options, so a
