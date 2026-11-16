@@ -33,6 +33,7 @@ pub const PERF_PMU_TYPE_SHIFT: u32 = 32;
 pub const PERF_FORMAT_GROUP: u64 = 1 << 3;
 
 pub const FLAG_DISABLED: u64 = 1 << 0;
+pub const FLAG_INHERIT: u64 = 1 << 1;
 pub const FLAG_PINNED: u64 = 1 << 2;
 pub const FLAG_EXCLUDE_KERNEL: u64 = 1 << 5;
 pub const FLAG_EXCLUDE_HV: u64 = 1 << 6;
@@ -46,11 +47,14 @@ pub const PERF_EVENT_IOC_DISABLE: u64 = 0x2401;
 pub const PERF_IOC_FLAG_GROUP: u64 = 1;
 
 /// The flags of the leader of a group: opened disabled, kept on the
-/// hardware all the time or put into an error state, user space only.
-pub const LEADER_FLAGS: u64 = FLAG_DISABLED | FLAG_PINNED | FLAG_EXCLUDE_KERNEL | FLAG_EXCLUDE_HV;
+/// hardware all the time or put into an error state, user space only,
+/// and copied into every thread and process its thread starts later.
+pub const LEADER_FLAGS: u64 =
+    FLAG_DISABLED | FLAG_INHERIT | FLAG_PINNED | FLAG_EXCLUDE_KERNEL | FLAG_EXCLUDE_HV;
 /// The flags of a member: it follows its leader, which only a leader
-/// may be pinned.
-pub const MEMBER_FLAGS: u64 = FLAG_EXCLUDE_KERNEL | FLAG_EXCLUDE_HV;
+/// may be pinned. The kernel refuses a member whose inheritance is not
+/// that of its leader.
+pub const MEMBER_FLAGS: u64 = FLAG_INHERIT | FLAG_EXCLUDE_KERNEL | FLAG_EXCLUDE_HV;
 
 /// The attributes of an event of a group: `event` is the hardware
 /// event, `unit` the type of a kind of cores or `None` for any.
@@ -85,6 +89,12 @@ mod tests {
         assert_eq!(offset_of!(PerfEventAttr, read_format), 32);
         assert_eq!(offset_of!(PerfEventAttr, flags), 40);
         assert_eq!(offset_of!(PerfEventAttr, config1), 56);
+    }
+
+    #[test]
+    fn every_event_is_inherited() {
+        assert_ne!(LEADER_FLAGS & FLAG_INHERIT, 0);
+        assert_ne!(MEMBER_FLAGS & FLAG_INHERIT, 0);
     }
 
     #[test]

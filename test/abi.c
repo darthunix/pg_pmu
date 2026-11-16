@@ -69,6 +69,7 @@ flags_word(const PmuPerfAbi *abi, bool leader)
 
 	memset(&attr, 0, sizeof(attr));
 	attr.disabled = leader;
+	attr.inherit = 1;
 	attr.pinned = leader;
 	attr.exclude_kernel = 1;
 	attr.exclude_hv = 1;

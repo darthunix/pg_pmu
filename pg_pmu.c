@@ -707,6 +707,7 @@ pmu_status_sqlstate(int32 status)
 		case PMU_CORES_NOT_COVERED:
 		case PMU_KIND_NOT_OPENABLE:
 		case PMU_TOO_MANY_KINDS:
+		case PMU_TOO_MANY_THREADS:
 			return ERRCODE_FEATURE_NOT_SUPPORTED;
 		case PMU_NO_FREE_COUNTER:
 		case PMU_NO_DESCRIPTOR:
@@ -762,6 +763,12 @@ pmu_report(int32 status, int32 os_error)
 					(errcode(pmu_status_sqlstate(status)),
 					 errmsg("the processor has more kinds of cores than pg_pmu counts on"),
 					 errdetail("It counts on up to four kinds.")));
+			break;
+		case PMU_TOO_MANY_THREADS:
+			ereport(ERROR,
+					(errcode(pmu_status_sqlstate(status)),
+					 errmsg("this process runs more threads than pg_pmu counts on"),
+					 errdetail("It counts up to 64 threads that run when the counters open.")));
 			break;
 		case PMU_KIND_NOT_OPENABLE:
 			ereport(ERROR,

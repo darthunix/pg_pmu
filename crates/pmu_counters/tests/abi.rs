@@ -10,7 +10,7 @@
 
 use pmu_counters::Status;
 
-const ALL: [Status; 16] = [
+const ALL: [Status; 17] = [
     Status::Ok,
     Status::NotPermitted,
     Status::NoSystem,
@@ -27,6 +27,7 @@ const ALL: [Status; 16] = [
     Status::CellBusy,
     Status::NoCell,
     Status::BadToken,
+    Status::TooManyThreads,
 ];
 
 /// The C name of each code, as the header spells it.
@@ -48,6 +49,7 @@ fn c_name(status: Status) -> &'static str {
         Status::CellBusy => "PMU_CELL_BUSY",
         Status::NoCell => "PMU_NO_CELL",
         Status::BadToken => "PMU_BAD_TOKEN",
+        Status::TooManyThreads => "PMU_TOO_MANY_THREADS",
     }
 }
 

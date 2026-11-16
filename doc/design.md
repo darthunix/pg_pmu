@@ -59,31 +59,66 @@ The code is in C (`pg_pmu.c`, `workers.c`) and in a Rust crate,
 
 ## Counting one process
 
-**Linux.** One `perf_event_open` group per process: instructions and
-cycles, user space only (no kernel, no hypervisor), for the thread of
-the process on any CPU. The group is *pinned*: the kernel either keeps
-it on the hardware all the time or puts it into an error state, so the
-counts are never scaled estimates. A read returns both values at once
-and is checked for length.
+**Linux.** One `perf_event_open` group for each thread of the
+process: instructions and cycles, user space only (no kernel, no
+hypervisor), for that thread on any CPU. The group is *pinned*: the
+kernel either keeps it on the hardware all the time or puts it into
+an error state, so the counts are never scaled estimates. A read
+returns both values at once and is checked for length.
+
+The threads are listed from `/proc/self/task` once, when the counters
+open, and every event is *inherited*: a thread that a counted thread
+starts later gets copies of its groups, which are enabled and
+disabled with them, and a read of a group adds in its copies, those
+of threads that have ended too. So the groups count the whole
+process: a thread that ran before, such as one that an extension
+started, and one started during a statement. The list is never made
+again, since a thread started later would then have a group of its
+own besides its copies, and count twice.
+
+```
+ listed at the opening:   T1 ---- group G1      T2 ---- group G2
+ started later by T1:     T3 ---- copies of G1, read with G1
+```
+
+Inheritance takes in the processes the backend starts once its
+counters are open as well, such as the program of `COPY ... PROGRAM`,
+while they run in a counting statement; macOS does not count them.
+Missed is only a thread that another thread starts while the counters
+open, after the list and before its parent's group. A process with
+more than 64 threads at the opening is refused (0A000) rather than
+counted in part.
+
+A copy is pinned like its group, but the kernel does not report a
+copy that has lost its counter: a read adds the copies in whatever
+their state. So the error state guards only the groups of the threads
+listed at the opening, and a copy can lose counts unseen when another
+pinned user takes the counters of its CPU.
+
+Linux before 4.13 refuses inherited events whose group is read at
+once. There pg_pmu opens the events without inheritance, and counts
+only the threads listed at the opening.
 
 On a hybrid processor (P and E cores) each core type has its own PMU
-in `/sys/bus/event_source/devices/*/cpus`. pg_pmu opens one group per
-type and adds them up, and refuses (0A000) if the types do not cover
-all online CPUs, since it would silently miss work otherwise.
+in `/sys/bus/event_source/devices/*/cpus`. pg_pmu opens a group for
+each type and each thread and adds them up, and refuses (0A000) if
+the types do not cover all online CPUs, since it would silently miss
+work otherwise.
 
-The group is opened once per process, at the first counting statement,
-with its file descriptors taken from PostgreSQL's budget of external
-files. Statements take references to it: the first reference enables
-it, the last disables it, so a nested EXPLAIN does not switch off the
-counters of the outer one.
+The groups are opened once per process, at the first counting
+statement, with their file descriptors, two for each group, taken
+from PostgreSQL's budget of external files. Statements take
+references to them: the first reference enables them, the last
+disables them, so a nested EXPLAIN does not switch off the counters
+of the outer one.
 
 **macOS.** `proc_pid_rusage(RUSAGE_INFO_V4)` gives `ri_instructions`
 and `ri_cycles` for the whole process, kernel included, without
 privileges. A virtual machine reports zero, which pg_pmu checks and
 refuses with 0A000.
 
-Linux and macOS counts are not comparable: one counts the kernel and
-all threads, the other neither.
+Linux and macOS counts are not comparable: both count every thread,
+but only macOS counts the kernel.
 
 ## Finding the statement
 
@@ -308,7 +343,15 @@ compile time.
 - **The protocol in C on PostgreSQL atomics.** No tool explores its
   interleavings.
 - **`rdpmc` for reads.** Faster, but a statement reads only a few
-  times.
+  times, and it reads only the calling thread.
+- **Only the calling thread.** Simpler, but it misses the threads of
+  an extension, and Linux then counts less than macOS.
+- **The threads listed at every statement, without inheritance.** It
+  would catch the threads started between statements, but miss those
+  started and ended inside one.
+- **`inherit_thread`, to leave child processes out.** It needs Linux
+  5.13, and the processes a backend starts are rare and part of its
+  work.
 
 ## Limitations
 
@@ -319,6 +362,8 @@ compile time.
   counted.
 - More nested counting statements at once than `pg_pmu.max_nested`
   fail with 53000.
+- On Linux, a copy of a group in a thread started later can lose
+  counts unseen; before Linux 4.13 such threads are not counted.
 - On a hybrid Intel CPU we assume the kernel skips a pinned group on
   the other core type rather than putting it into the error state.
   This needs checking on such a machine.

@@ -15,9 +15,10 @@ use std::collections::{BTreeSet, HashMap};
 
 use proptest::prelude::*;
 
-use pmu_counters::counters::perf::{Perf, PerfSys, open_error};
+use pmu_counters::counters::perf::{MAX_THREADS, Perf, PerfSys, open_error, parse_tid};
 use pmu_counters::counters::perf_abi::{
-    LEADER_FLAGS, MEMBER_FLAGS, PERF_EVENT_IOC_DISABLE, PERF_EVENT_IOC_ENABLE, PerfEventAttr,
+    FLAG_INHERIT, LEADER_FLAGS, MEMBER_FLAGS, PERF_EVENT_IOC_DISABLE, PERF_EVENT_IOC_ENABLE,
+    PerfEventAttr,
 };
 use pmu_counters::counters::{Backend, Counters, Counts};
 use pmu_counters::sysfs::{self, Fs, MAX_KINDS, Malformed, Plan};
@@ -412,8 +413,17 @@ struct FakeSys {
     opens: usize,
     /// Reads of an enabled leader give no bytes: no free counter.
     error_state: bool,
-    /// Each open: its attributes and the group it joins.
-    opened: Vec<(PerfEventAttr, i32)>,
+    /// Each open: its attributes, its thread and the group it joins.
+    opened: Vec<(PerfEventAttr, i32, i32)>,
+    /// The thread of each descriptor.
+    tid_of: HashMap<i32, i32>,
+    /// What the listing of threads gives, or its errno; None: the one
+    /// thread 1.
+    list: Option<Result<Vec<i32>, i32>>,
+    /// Threads that have ended: an open on one fails with ESRCH.
+    gone: BTreeSet<i32>,
+    /// A kernel before 4.13: inherited events fail with EINVAL.
+    refuse_inherit: bool,
     /// Each ioctl: its descriptor, request and argument.
     ioctls: Vec<(i32, u64, u64)>,
     /// What reads of instructions give, or the descriptor if None.
@@ -423,7 +433,7 @@ struct FakeSys {
 }
 
 impl PerfSys for FakeSys {
-    fn open(&mut self, attr: &PerfEventAttr, group_fd: i32) -> Result<i32, i32> {
+    fn open(&mut self, attr: &PerfEventAttr, tid: i32, group_fd: i32) -> Result<i32, i32> {
         let index = self.opens;
         self.opens += 1;
         if let Some((i, e)) = self.fail_open
@@ -431,11 +441,20 @@ impl PerfSys for FakeSys {
         {
             return Err(e);
         }
+        if self.gone.contains(&tid) {
+            return Err(libc::ESRCH);
+        }
+        if self.refuse_inherit && attr.flags & FLAG_INHERIT != 0 {
+            return Err(libc::EINVAL);
+        }
+        // A member joins a leader on its own thread.
         assert!(group_fd == -1 || self.leaders.contains(&group_fd));
-        self.opened.push((*attr, group_fd));
+        assert!(group_fd == -1 || self.tid_of[&group_fd] == tid);
+        self.opened.push((*attr, tid, group_fd));
         self.next_fd += 1;
         let fd = self.next_fd + 100;
         self.open.insert(fd);
+        self.tid_of.insert(fd, tid);
         if group_fd == -1 {
             self.leaders.insert(fd);
         }
@@ -479,6 +498,18 @@ impl PerfSys for FakeSys {
         self.enabled.remove(&fd);
     }
 
+    fn threads(&mut self, out: &mut [i32]) -> Result<usize, i32> {
+        let threads = match &self.list {
+            None => vec![1],
+            Some(Ok(threads)) => threads.clone(),
+            Some(Err(e)) => return Err(*e),
+        };
+        for (slot, tid) in out.iter_mut().zip(&threads) {
+            *slot = *tid;
+        }
+        Ok(threads.len())
+    }
+
     fn uniform_cores(&self) -> Option<bool> {
         Some(true)
     }
@@ -506,17 +537,28 @@ const ERRNOS: [i32; 8] = [
 proptest! {
     #[test]
     fn a_failed_opening_closes_what_it_opened(count in 1usize..=MAX_KINDS, typed in any::<bool>(),
-                                              at in 0usize..8, errno in prop::sample::select(&ERRNOS[..])) {
+                                              threads in 1usize..=3, at in 0usize..28,
+                                              errno in prop::sample::select(&ERRNOS[..])) {
         let typed = typed && count > 1;
-        let mut perf = Perf::with(FakeSys { fail_open: Some((at, errno)), ..FakeSys::default() });
-        prop_assert_eq!(perf.set_plan(plan_of(count, typed)), 2 * count as u32);
+        let list = (1..=threads as i32).collect();
+        let mut perf = Perf::with(FakeSys {
+            fail_open: Some((at, errno)),
+            list: Some(Ok(list)),
+            ..FakeSys::default()
+        });
+        let events = 2 * count * threads;
+        prop_assert_eq!(perf.set_plan(plan_of(count, typed)), Ok(events as u32));
         let r = perf.open();
-        if at < 2 * count {
+        // EINVAL to the first leader is taken for a kernel that refuses
+        // inheritance: the next open, without it, succeeds.
+        let refused = errno == libc::EINVAL && at == 0;
+        prop_assert_eq!(perf.inherits(), !refused);
+        if at < events && !refused {
             prop_assert_eq!(r, Err(open_error(errno, typed)));
             prop_assert!(perf.sys().open.is_empty(), "left open: {:?}", perf.sys().open);
         } else {
             prop_assert_eq!(r, Ok(()));
-            prop_assert_eq!(perf.sys().open.len(), 2 * count);
+            prop_assert_eq!(perf.sys().open.len(), events);
             prop_assert!(perf.sys().enabled.is_empty(), "the check leaves them disabled");
         }
     }
@@ -528,7 +570,7 @@ fn a_next_opening_succeeds_after_a_failure() {
         fail_open: Some((3, libc::EMFILE)),
         ..FakeSys::default()
     });
-    perf.set_plan(plan_of(2, true));
+    perf.set_plan(plan_of(2, true)).unwrap();
     assert_eq!(perf.open().unwrap_err().status, Status::NoDescriptor);
     assert!(perf.sys().open.is_empty());
     perf.sys_mut().fail_open = None;
@@ -545,7 +587,7 @@ fn leaders_count_instructions_and_members_cycles_of_their_kind() {
     for typed in [false, true] {
         let count = if typed { 2 } else { 1 };
         let mut perf = Perf::with(FakeSys::default());
-        perf.set_plan(plan_of(count, typed));
+        perf.set_plan(plan_of(count, typed)).unwrap();
         perf.open().unwrap();
         let opened = &perf.sys().opened;
         assert_eq!(opened.len(), 2 * count);
@@ -556,14 +598,15 @@ fn leaders_count_instructions_and_members_cycles_of_their_kind() {
             assert_eq!(member.0.config, PERF_COUNT_HW_CPU_CYCLES | unit);
             assert_eq!(leader.0.flags, LEADER_FLAGS);
             assert_eq!(member.0.flags, MEMBER_FLAGS);
-            for (attr, _) in pair {
+            for (attr, tid, _) in pair {
                 assert_eq!(attr.type_, PERF_TYPE_HARDWARE);
                 assert_eq!(attr.read_format, PERF_FORMAT_GROUP);
                 assert_eq!(attr.size, 64);
+                assert_eq!(*tid, 1);
             }
             // The leader opens alone; the member joins its group.
-            assert_eq!(leader.1, -1);
-            assert_eq!(member.1, 100 + 1 + 2 * g as i32);
+            assert_eq!(leader.2, -1);
+            assert_eq!(member.2, 100 + 1 + 2 * g as i32);
         }
         // Every enable and disable applies to the whole group.
         assert!(!perf.sys().ioctls.is_empty());
@@ -582,7 +625,7 @@ fn a_group_that_counts_nothing_is_refused() {
         instructions: Some(0),
         ..FakeSys::default()
     });
-    perf.set_plan(plan_of(1, false));
+    perf.set_plan(plan_of(1, false)).unwrap();
     assert_eq!(perf.open().unwrap_err().status, Status::NoCounters);
     assert!(perf.sys().open.is_empty());
 }
@@ -590,7 +633,7 @@ fn a_group_that_counts_nothing_is_refused() {
 #[test]
 fn a_failed_enable_leaves_no_group_on() {
     let mut perf = Perf::with(FakeSys::default());
-    perf.set_plan(plan_of(2, true));
+    perf.set_plan(plan_of(2, true)).unwrap();
     perf.open().unwrap();
     perf.sys_mut().fail_enable_of = Some(103);
     assert!(perf.enable().is_err());
@@ -636,7 +679,7 @@ fn no_free_counter_at_opening_and_a_lost_one_later() {
         error_state: true,
         ..FakeSys::default()
     });
-    perf.set_plan(plan_of(1, false));
+    perf.set_plan(plan_of(1, false)).unwrap();
     assert_eq!(perf.open().unwrap_err().status, Status::NoFreeCounter);
     assert!(perf.sys().open.is_empty());
 
@@ -651,13 +694,151 @@ fn no_free_counter_at_opening_and_a_lost_one_later() {
 #[test]
 fn groups_are_added() {
     let mut perf = Perf::with(FakeSys::default());
-    perf.set_plan(plan_of(2, true));
+    perf.set_plan(plan_of(2, true)).unwrap();
     perf.open().unwrap();
     perf.enable().unwrap();
     let c = perf.read().unwrap();
     // The fake reads 1000 + fd and 2000 + fd for leaders 101 and 103.
     assert_eq!(c.instructions, 1101 + 1103);
     assert_eq!(c.cycles, 2101 + 2103);
+}
+
+#[test]
+fn each_thread_has_a_group_of_each_kind() {
+    let mut perf = Perf::with(FakeSys {
+        list: Some(Ok(vec![7, 8, 9])),
+        ..FakeSys::default()
+    });
+    assert_eq!(perf.set_plan(plan_of(2, true)), Ok(12));
+    perf.open().unwrap();
+    let tids: Vec<i32> = perf.sys().opened.iter().map(|o| o.1).collect();
+    assert_eq!(tids, [7, 7, 7, 7, 8, 8, 8, 8, 9, 9, 9, 9]);
+    perf.enable().unwrap();
+    assert_eq!(perf.sys().enabled.len(), 6);
+    // The fake reads 1000 + fd and 2000 + fd for leaders 101, 103, ...
+    let c = perf.read().unwrap();
+    let leaders = (0..6).map(|g| 101 + 2 * g);
+    assert_eq!(c.instructions, leaders.clone().map(|fd| 1000 + fd).sum());
+    assert_eq!(c.cycles, leaders.map(|fd| 2000 + fd).sum());
+    perf.disable().unwrap();
+    assert!(perf.sys().enabled.is_empty());
+}
+
+#[test]
+fn a_thread_that_ended_is_left_out() {
+    let mut perf = Perf::with(FakeSys {
+        list: Some(Ok(vec![7, 8, 9])),
+        gone: BTreeSet::from([8]),
+        ..FakeSys::default()
+    });
+    // Its descriptors were planned; it uses none of them.
+    assert_eq!(perf.set_plan(plan_of(2, true)), Ok(12));
+    perf.open().unwrap();
+    assert_eq!(perf.sys().open.len(), 8);
+    assert!(perf.sys().opened.iter().all(|o| o.1 != 8));
+    perf.enable().unwrap();
+    assert_eq!(perf.sys().enabled.len(), 4);
+    perf.read().unwrap();
+}
+
+proptest! {
+    /// Thread 8 ends at one of its four opens: what it opened is closed,
+    /// and the threads before and after it count.
+    #[test]
+    fn a_thread_that_ends_while_it_opens_keeps_nothing(at in 4usize..8) {
+        let mut perf = Perf::with(FakeSys {
+            list: Some(Ok(vec![7, 8, 9])),
+            fail_open: Some((at, libc::ESRCH)),
+            ..FakeSys::default()
+        });
+        perf.set_plan(plan_of(2, true)).unwrap();
+        prop_assert_eq!(perf.open(), Ok(()));
+        let sys = perf.sys();
+        let tids: BTreeSet<i32> = sys.open.iter().map(|fd| sys.tid_of[fd]).collect();
+        prop_assert_eq!(tids, BTreeSet::from([7, 9]));
+        prop_assert_eq!(sys.open.len(), 8);
+    }
+}
+
+#[test]
+fn a_kernel_that_refuses_inheritance_counts_the_listed_threads() {
+    let mut perf = Perf::with(FakeSys {
+        list: Some(Ok(vec![7, 8])),
+        refuse_inherit: true,
+        ..FakeSys::default()
+    });
+    perf.set_plan(plan_of(2, true)).unwrap();
+    perf.open().unwrap();
+    assert!(!perf.inherits());
+    let sys = perf.sys();
+    assert_eq!(sys.open.len(), 8);
+    // One refused open, then every event without inheritance.
+    assert_eq!(sys.opens, 9);
+    assert!(sys.opened.iter().all(|o| o.0.flags & FLAG_INHERIT == 0));
+    assert_eq!(sys.opened[0].0.flags, LEADER_FLAGS & !FLAG_INHERIT);
+    assert_eq!(sys.opened[1].0.flags, MEMBER_FLAGS & !FLAG_INHERIT);
+}
+
+#[test]
+fn an_einval_after_the_first_leader_is_an_error() {
+    // The first group opened with inheritance, so the kernel takes it:
+    // EINVAL to a later leader, of another kind, is that kind's error.
+    let mut perf = Perf::with(FakeSys {
+        fail_open: Some((2, libc::EINVAL)),
+        ..FakeSys::default()
+    });
+    perf.set_plan(plan_of(2, true)).unwrap();
+    let e = perf.open().unwrap_err();
+    assert_eq!(e, open_error(libc::EINVAL, true));
+    assert!(perf.inherits());
+    assert!(perf.sys().open.is_empty());
+}
+
+#[test]
+fn the_listing_of_threads_is_checked() {
+    let mut perf = Perf::with(FakeSys::default());
+    let too_many = (1..=MAX_THREADS as i32 + 1).collect();
+    perf.sys_mut().list = Some(Ok(too_many));
+    let e = perf.set_plan(plan_of(1, false)).unwrap_err();
+    assert_eq!(e.status, Status::TooManyThreads);
+    perf.sys_mut().list = Some(Ok((1..=MAX_THREADS as i32).collect()));
+    assert_eq!(perf.set_plan(plan_of(1, false)), Ok(2 * MAX_THREADS as u32));
+    perf.sys_mut().list = Some(Ok(vec![]));
+    let e = perf.set_plan(plan_of(1, false)).unwrap_err();
+    assert_eq!(e.status, Status::SystemError);
+    perf.sys_mut().list = Some(Err(libc::ENOENT));
+    let e = perf.set_plan(plan_of(1, false)).unwrap_err();
+    assert_eq!(e, Error::os(Status::SystemError, libc::ENOENT));
+    perf.sys_mut().list = Some(Err(libc::EMFILE));
+    let e = perf.set_plan(plan_of(1, false)).unwrap_err();
+    assert_eq!(e, Error::os(Status::NoDescriptor, libc::EMFILE));
+}
+
+#[test]
+fn names_of_threads() {
+    assert_eq!(parse_tid(b"1"), Some(1));
+    assert_eq!(parse_tid(b"2147483647"), Some(i32::MAX));
+    for name in [
+        &b""[..],
+        b".",
+        b"..",
+        b"0",
+        b"2147483648",
+        b"+1",
+        b"-1",
+        b"1a",
+    ] {
+        assert_eq!(parse_tid(name), None, "{name:?}");
+    }
+}
+
+proptest! {
+    #[test]
+    fn names_of_threads_are_what_rust_parses(name in "[0-9.a+-]{0,12}") {
+        let digits = !name.is_empty() && name.bytes().all(|b| b.is_ascii_digit());
+        let want = name.parse::<i32>().ok().filter(|&t| digits && t > 0);
+        prop_assert_eq!(parse_tid(name.as_bytes()), want);
+    }
 }
 
 // ---------------------------------------------------------------------
