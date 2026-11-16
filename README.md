@@ -40,8 +40,11 @@ pg_stat_kcache for that), systems other than Linux and macOS.
   `CAP_PERFMON`. Containers and security modules may refuse too.
 - Virtual machines often have no counters, among them GitHub's macOS
   runners and some of its x86-64 Linux runners.
-- Linux counts user space of the process's thread only; macOS counts
-  the whole process, kernel included. Do not compare the two.
+- Both count every thread of the process. Linux counts user space
+  only, and also the processes the backend starts once it counts,
+  such as the program of `COPY ... PROGRAM`; before Linux 4.13 it
+  misses threads started after its first counting statement. macOS
+  counts the kernel too. Do not compare the two.
 - The counts include EXPLAIN ANALYZE's own measuring of each node, a
   few dozen instructions per row per node. `TIMING off` reduces it.
 - Not counted: the executor's end, the start of the workers, and
@@ -86,8 +89,9 @@ When the system cannot count, the statement fails, usually before it
 runs:
 
 - 42501: counting is not allowed (see Limitations);
-- 0A000: there are no counters, as in many virtual machines, or the
-  kinds of cores of the processor cannot all be counted;
+- 0A000: there are no counters, as in many virtual machines, the
+  kinds of cores of the processor cannot all be counted, or the
+  process runs more than 64 threads;
 - 53000: no free hardware counter or file descriptor, or a counter
   lost while the statement ran.
 

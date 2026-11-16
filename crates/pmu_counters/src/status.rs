@@ -43,6 +43,8 @@ pub enum Status {
     NoCell = 14,
     /// XX000: a token that is not a token of a cell.
     BadToken = 15,
+    /// 0A000: more threads run in the process than the crate counts on.
+    TooManyThreads = 16,
 }
 
 /// A code with the error of the system, `errno`, where there is one,

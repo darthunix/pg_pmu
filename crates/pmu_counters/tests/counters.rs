@@ -15,7 +15,7 @@ use common::{counters, work};
 
 #[test]
 fn counts_grow_with_the_work() {
-    let Some(mut c) = counters() else {
+    let Some((_one, mut c)) = counters() else {
         return;
     };
     let start = c.acquire().expect("acquire");
@@ -29,7 +29,7 @@ fn counts_grow_with_the_work() {
 
 #[test]
 fn opening_twice_does_nothing_more() {
-    let Some(mut c) = counters() else {
+    let Some((_one, mut c)) = counters() else {
         return;
     };
     assert_eq!(c.open(), Ok(()));
@@ -40,7 +40,7 @@ fn opening_twice_does_nothing_more() {
 #[cfg(target_os = "linux")]
 #[test]
 fn disabled_counters_do_not_count() {
-    let Some(mut c) = counters() else {
+    let Some((_one, mut c)) = counters() else {
         return;
     };
     let before = c.acquire().expect("acquire");

@@ -1,7 +1,14 @@
 //! What the tests of the counters of this machine share.
 
+use std::sync::{Mutex, MutexGuard};
+
 use pmu_counters::Status;
 use pmu_counters::counters::{Counters, Platform, platform};
+
+/// One test of a binary counts at a time. Counters of the whole process
+/// open groups on the threads of the other tests too, and groups of two
+/// tests enabled on one thread at once can run out of hardware counters.
+static ONE_AT_A_TIME: Mutex<()> = Mutex::new(());
 
 /// Work the compiler cannot remove.
 pub fn work(n: u64) -> u64 {
@@ -26,12 +33,15 @@ fn cannot_count(status: Status) -> bool {
     )
 }
 
-/// Plan and open the counters of this machine, or return `None` where
-/// it cannot count, unless PG_PMU_REQUIRE_COUNTERS says it must.
-pub fn counters() -> Option<Counters<Platform>> {
+/// Plan and open the counters of this machine, with the lock that the
+/// test holds while it counts, or return `None` where it cannot count,
+/// unless PG_PMU_REQUIRE_COUNTERS says it must.
+pub fn counters() -> Option<(MutexGuard<'static, ()>, Counters<Platform>)> {
+    // A test that failed holding the lock leaves nothing to protect.
+    let one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
     let mut c = Counters::new(platform());
     match c.plan(c"/sys").and_then(|_| c.open()) {
-        Ok(()) => Some(c),
+        Ok(()) => Some((one, c)),
         Err(e) => {
             assert!(cannot_count(e.status), "{e:?}");
             assert!(

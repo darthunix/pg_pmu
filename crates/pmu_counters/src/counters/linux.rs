@@ -1,8 +1,8 @@
 //! The calls of the system behind [`super::perf::Perf`] on Linux.
 
-use core::ffi::{c_int, c_ulong};
+use core::ffi::{CStr, c_int, c_ulong};
 
-use super::perf::PerfSys;
+use super::perf::{PerfSys, parse_tid};
 use super::perf_abi::{PERF_FLAG_FD_CLOEXEC, PerfEventAttr};
 
 pub struct LinuxSys;
@@ -25,14 +25,15 @@ fn errno() -> i32 {
 }
 
 impl PerfSys for LinuxSys {
-    fn open(&mut self, attr: &PerfEventAttr, group_fd: i32) -> Result<i32, i32> {
+    fn open(&mut self, attr: &PerfEventAttr, tid: i32, group_fd: i32) -> Result<i32, i32> {
         // SAFETY: attr is a PerfEventAttr whose size field says 64 bytes,
-        // which it has; pid 0 and cpu -1 are this thread on any CPU.
+        // which it has; a thread's id and cpu -1 are that thread on any
+        // CPU.
         let fd = unsafe {
             libc::syscall(
                 libc::SYS_perf_event_open,
                 core::ptr::from_ref(attr),
-                0 as libc::pid_t,
+                tid as libc::pid_t,
                 -1 as c_int,
                 group_fd as c_int,
                 PERF_FLAG_FD_CLOEXEC as c_ulong,
@@ -59,6 +60,40 @@ impl PerfSys for LinuxSys {
     fn close(&mut self, fd: i32) {
         // SAFETY: fd is a descriptor this crate opened.
         unsafe { libc::close(fd) };
+    }
+
+    fn threads(&mut self, out: &mut [i32]) -> Result<usize, i32> {
+        // SAFETY: the path is a string ending in zero.
+        let dir = unsafe { libc::opendir(c"/proc/self/task".as_ptr()) };
+        if dir.is_null() {
+            return Err(errno());
+        }
+        let mut n = 0usize;
+        let listed = loop {
+            // readdir returns null at the end and on an error, and sets
+            // errno only on an error.
+            // SAFETY: __errno_location returns the address of the
+            // thread's errno.
+            unsafe { *libc::__errno_location() = 0 };
+            // SAFETY: dir is an open directory stream.
+            let entry = unsafe { libc::readdir(dir) };
+            if entry.is_null() {
+                let e = errno();
+                break if e == 0 { Ok(n) } else { Err(e) };
+            }
+            // SAFETY: the entry readdir returned stays valid until the
+            // next call, and its name ends in zero.
+            let name = unsafe { CStr::from_ptr((*entry).d_name.as_ptr()) };
+            if let Some(tid) = parse_tid(name.to_bytes()) {
+                if let Some(slot) = out.get_mut(n) {
+                    *slot = tid;
+                }
+                n = n.saturating_add(1);
+            }
+        };
+        // SAFETY: dir is open, and closed once.
+        unsafe { libc::closedir(dir) };
+        listed
     }
 
     #[cfg(target_arch = "x86_64")]

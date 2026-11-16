@@ -38,6 +38,7 @@
 #define PMU_CELL_BUSY			13	/* XX000 */
 #define PMU_NO_CELL				14	/* 53000 */
 #define PMU_BAD_TOKEN			15	/* XX000 */
+#define PMU_TOO_MANY_THREADS	16	/* 0A000 */
 
 /* Instructions and cycles counted so far; only differences mean much. */
 typedef struct PmuCounts
