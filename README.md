@@ -24,7 +24,8 @@ EXPLAIN (ANALYZE, PMU branches, TIMING off) SELECT count(*) FROM t;
  Execution PMU: instructions=43218494 cycles=7733504 branches=7915310 branch-misses=1201
 ```
 
-How the module works is in [doc/design.md](doc/design.md).
+How the module works is in [doc/design.md](doc/design.md); on
+Greengage, see [gg/README.md](gg/README.md).
 
 ## Goals
 
@@ -44,8 +45,10 @@ pg_stat_kcache for that), systems other than Linux and macOS.
 
 ## Limitations
 
-- PostgreSQL 19 and master; Linux and macOS.
-- Loaded only with `shared_preload_libraries`, so it needs a restart.
+- PostgreSQL 19 and master; Linux and macOS. Greengage 7 with the
+  hooks of EXPLAIN for extensions, see [gg/README.md](gg/README.md).
+- On PostgreSQL, loaded only with `shared_preload_libraries`, so it
+  needs a restart.
 - Linux needs `kernel.perf_event_paranoid` of 2 or less, or
   `CAP_PERFMON`. Containers and security modules may refuse too.
 - Virtual machines often have no counters, among them GitHub's macOS
