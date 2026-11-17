@@ -1,8 +1,8 @@
 /*-------------------------------------------------------------------------
  *
  * pg_pmu.c
- *		Counts of instructions and cycles of the processor in EXPLAIN
- *		ANALYZE.
+ *		Counts of the processor in EXPLAIN ANALYZE: instructions and
+ *		cycles, and branches and the cache where asked.
  *
  * The module adds the option PMU to EXPLAIN. It must be loaded with
  * shared_preload_libraries: it defines a setting of the start of the
@@ -26,6 +26,7 @@
 #include "optimizer/planner.h"
 #include "storage/fd.h"
 #include "tcop/utility.h"
+#include "utils/builtins.h"
 #include "utils/guc.h"
 
 #include "pg_pmu.h"
@@ -239,13 +240,40 @@ pmu_ensure_state(ExplainState *es)
 }
 
 /*
- * EXPLAIN (PMU [boolean]): takes the values of PostgreSQL's own boolean
- * options, and counts instructions and cycles.
+ * EXPLAIN (PMU [value]): the values of PostgreSQL's own boolean options
+ * turn the counting of instructions and cycles on and off; branches,
+ * cache and full count those beside them. As with PostgreSQL's own
+ * options, the last value given counts.
  */
 static void
 pmu_option_handler(ExplainState *es, DefElem *opt, ParseState *pstate)
 {
-	pmu_ensure_state(es)->sets = defGetBoolean(opt) ? PMU_EVENTS_BASIC : 0;
+	PmuExplainState *state = pmu_ensure_state(es);
+	char	   *value;
+	bool		on;
+
+	if (opt->arg == NULL)
+	{
+		state->sets = PMU_EVENTS_BASIC;
+		return;
+	}
+	value = defGetString(opt);
+	if (pg_strcasecmp(value, "branches") == 0)
+		state->sets = PMU_EVENTS_BASIC | PMU_EVENTS_BRANCHES;
+	else if (pg_strcasecmp(value, "cache") == 0)
+		state->sets = PMU_EVENTS_BASIC | PMU_EVENTS_CACHE;
+	else if (pg_strcasecmp(value, "full") == 0)
+		state->sets = PMU_EVENTS_BASIC | PMU_EVENTS_BRANCHES |
+			PMU_EVENTS_CACHE;
+	else if (parse_bool(value, &on))
+		state->sets = on ? PMU_EVENTS_BASIC : 0;
+	else
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("unrecognized value for EXPLAIN option \"%s\": \"%s\"",
+						opt->defname, value),
+				 errhint("It takes a Boolean value, branches, cache or full."),
+				 parser_errposition(pstate, opt->location)));
 }
 
 /*
@@ -317,8 +345,20 @@ pmu_validate_options(ExplainState *es, List *options, ParseState *pstate)
 	pmu_frames->sets = state->sets;
 	state->frame = pmu_frames;
 
-	/* The cell of its workers; none left in the pool fails it here. */
-	pmu_frames->hold = pmu_take_cell(&pmu_frames->guc_level);
+	/*
+	 * The cell of its workers; none left in the pool fails it here. They
+	 * count the sets of the statements that count around this one too,
+	 * since their counts are handed down to those.
+	 */
+	{
+		uint32		workers_sets = state->sets;
+
+		for (PmuFrame *f = pmu_frames->prev; f != NULL; f = f->prev)
+			if (f->counting)
+				workers_sets |= f->sets;
+		pmu_frames->hold = pmu_take_cell(workers_sets,
+										 &pmu_frames->guc_level);
+	}
 }
 
 /*
@@ -688,6 +728,44 @@ pmu_explain_per_plan(PlannedStmt *plannedstmt, IntoClause *into,
 #define PMU_SYSTEM_DETAIL() \
 	(os_error != 0 ? errdetail("The system said: %m.") : 0)
 
+/* What a set counts, for its errors. */
+static const char *
+pmu_set_name(uint32 set)
+{
+	switch (set)
+	{
+		case PMU_EVENTS_BRANCHES:
+			return "branches and branch misses";
+		case PMU_EVENTS_CACHE:
+			return "cache references and cache misses";
+		default:
+			return "instructions and cycles";
+	}
+}
+
+/* Fail the opening of a set: name it where the system lacks its events. */
+pg_noreturn static void
+pmu_report_set(uint32 set, int32 status, int32 os_error)
+{
+	if (status == PMU_EVENTS_NOT_COUNTED)
+	{
+		errno = os_error;
+#ifdef __APPLE__
+		ereport(ERROR,
+				(errcode(pmu_status_sqlstate(status)),
+				 errmsg("this system cannot count %s", pmu_set_name(set)),
+				 errdetail("macOS lets a process count only its instructions and cycles.")));
+#else
+		ereport(ERROR,
+				(errcode(pmu_status_sqlstate(status)),
+				 errmsg("this system cannot count %s", pmu_set_name(set)),
+				 PMU_SYSTEM_DETAIL(),
+				 errhint("The processor or the kernel has no such events, as in many virtual machines.")));
+#endif
+	}
+	pmu_report(status, os_error);
+}
+
 /*
  * Open the counters of the sets of this process that are not open yet,
  * the basic one first; each stays open until the process exits. The
@@ -715,7 +793,7 @@ pmu_open_counters(uint32 sets)
 
 		status = pmu_counters_plan(PMU_SYSFS, set, &descriptors, &os_error);
 		if (status != PMU_OK)
-			pmu_report(status, os_error);
+			pmu_report_set(set, status, os_error);
 
 		for (uint32 taken = 0; taken < descriptors; taken++)
 		{
@@ -730,7 +808,7 @@ pmu_open_counters(uint32 sets)
 		if (status != PMU_OK)
 		{
 			pmu_release_descriptors(descriptors);
-			pmu_report(status, os_error);
+			pmu_report_set(set, status, os_error);
 		}
 		pmu_sets_open |= set;
 	}
@@ -838,7 +916,10 @@ pmu_report(int32 status, int32 os_error)
 		case PMU_NO_FREE_COUNTER:
 			ereport(ERROR,
 					(errcode(pmu_status_sqlstate(status)),
-					 errmsg("no hardware counter is free for this process")));
+					 errmsg("no hardware counter is free for this process"),
+					 errhint("Each pair of events counted takes two of the few counters of a core, "
+							 "and other users of them, such as the NMI watchdog of Linux, take some; "
+							 "the branches and the cache may be counted in separate statements.")));
 			break;
 		case PMU_NO_DESCRIPTOR:
 			ereport(ERROR,

@@ -2,7 +2,8 @@
 
 pg_pmu adds an option `PMU` to `EXPLAIN ANALYZE`. It reports how many
 instructions and cycles the processor spent on one statement,
-including its parallel workers:
+including its parallel workers, and on Linux, when asked, the branches
+and the cache:
 
 ```
 EXPLAIN (ANALYZE, PMU, VERBOSE) SELECT count(*) FROM t;
@@ -21,6 +22,12 @@ cycles vary much more. The goals and limitations are in the
 This note explains how the module counts one process, how it finds
 the statement, and how parallel workers report their part.
 
+The counters come in *sets*, pairs of events counted together: the
+basic set, instructions and cycles, which every counting statement
+counts; the branches, all of them and those the processor
+mispredicted; and the cache, references and misses. `PMU branches`,
+`PMU cache` and `PMU full` add the other sets to the basic one.
+
 ## The big picture
 
 The module is loaded with `shared_preload_libraries`. It installs
@@ -32,13 +39,14 @@ The work for one statement looks like this:
  ─────────────────────────────────────────  ────────────────────────
  EXPLAIN starts    push a frame
  options checked   open counters, take a
-                   cell, pg_pmu.cell = token
+                   cell, pg_pmu.cell = token,
+                   pg_pmu.events = sets
  planner           counters read around it
  ── start: read counters + cell ──
  ExecutorStart
  ExecutorRun
    Gather ──── launches (settings copied, ──► ExecutorStart  ┐ counted
-               token included)                ExecutorRun     │
+               token, sets included)          ExecutorRun     │
    waits ◄──── adds its counts to the cell ── ExecutorFinish  ┘
  ExecutorFinish    (AFTER triggers)
  ── finish: read counters + cell ──
@@ -59,15 +67,39 @@ The code is in C (`pg/pg_pmu.c`, `pg/workers.c`) and in a Rust crate,
 
 ## Counting one process
 
-**Linux.** One `perf_event_open` group for each thread of the
-process: instructions and cycles, user space only (no kernel, no
-hypervisor), for that thread on any CPU. The group is *pinned*: the
-kernel either keeps it on the hardware all the time or puts it into
-an error state, so the counts are never scaled estimates. A read
-returns both values at once and is checked for length.
+**Linux.** One `perf_event_open` group for each set and each thread
+of the process: the two events of the set, user space only (no
+kernel, no hypervisor), for that thread on any CPU. The group is
+*pinned*: the kernel either keeps it on the hardware all the time or
+puts it into an error state, so the counts are never scaled
+estimates. A read returns both values at once and is checked for
+length.
+
+The branches and the cache are the kernel's generic events
+(`PERF_COUNT_HW_BRANCH_INSTRUCTIONS` and `_BRANCH_MISSES`,
+`PERF_COUNT_HW_CACHE_REFERENCES` and `_CACHE_MISSES`). Each processor
+maps them to its own: the cache is the last level on Intel, the
+second on AMD and the first on Arm, so their counts compare only on
+one machine. Each set has groups of its own, so that a machine with
+few free counters still counts instructions when it cannot count the
+others, and a set is opened only when a statement first asks for it.
+A process opens the basic set first and the others when a statement
+first asks for them, and the kernel puts the pinned groups of a
+thread on the counters in the order they were made, so another set
+cannot take the counters of the basic one. Of the branches and the
+cache, the one opened first wins: on a core without six free
+counters, a statement that counts the later one fails with 53000 when
+a nested statement enables the earlier one. A group of the other sets
+that reads zero at its check is refused like the basic one: the
+calling thread takes branches in between, and refers to the cache
+too, on x86-64 by flushing a line of its stack from every level with
+`clflush` and loading it again, so that the load misses the levels
+below the one the event counts. Some hypervisors open the events of
+the cache and never count them; this check is what keeps their zeros
+from being printed as counts.
 
 The threads are listed from `/proc/self/task` once, when the counters
-open, and every event is *inherited*: a thread that a counted thread
+of a set open, and every event is *inherited*: a thread that a counted thread
 starts later gets copies of its groups, which are enabled and
 disabled with them, and a read of a group adds in its copies, those
 of threads that have ended too. So the groups count the whole
@@ -105,17 +137,25 @@ each type and each thread and adds them up, and refuses (0A000) if
 the types do not cover all online CPUs, since it would silently miss
 work otherwise.
 
-The groups are opened once per process, at the first counting
-statement, with their file descriptors, two for each group, taken
-from PostgreSQL's budget of external files. Statements take
-references to them: the first reference enables them, the last
-disables them, so a nested EXPLAIN does not switch off the counters
-of the outer one.
+The groups of a set are opened once per process, at the first
+counting statement that asks for the set, with their file
+descriptors, two for each group, taken from PostgreSQL's budget of
+external files. Statements take references to each set they count:
+the first reference to a set enables its groups, the last disables
+them, so a nested EXPLAIN does not switch off the counters of the
+outer one, and a set nobody counts holds no hardware counter. When a
+nested EXPLAIN opens a set, the check of its new groups enables and
+disables only them, and the sets the outer statement counts go on.
+The kernel reports a set that it cannot count with ENOENT,
+EOPNOTSUPP, ENODEV or EINVAL, which pg_pmu turns into 0A000; the
+basic set has opened by then, so nothing else is left to refuse.
 
 **macOS.** `proc_pid_rusage(RUSAGE_INFO_V4)` gives `ri_instructions`
 and `ri_cycles` for the whole process, kernel included, without
 privileges. A virtual machine reports zero, which pg_pmu checks and
-refuses with 0A000.
+refuses with 0A000. The other sets need the counters of the
+processor, which macOS gives only to root, so a statement that asks
+for them fails with 0A000 before it runs.
 
 Linux and macOS counts are not comparable: both count every thread,
 but only macOS counts the kernel.
@@ -198,12 +238,20 @@ none is free. An EXPLAIN that a parallel worker runs takes no cell:
 a worker has no workers of its own.
 
 The backend passes the cell to its workers as a *token* in the hidden
-setting `pg_pmu.cell`. PostgreSQL copies settings into every worker
-it starts, so no other channel is needed. Users cannot change the
-setting: it is a connection-start setting, so `SET` and `RESET` fail
-with 55P02, and a value given at connection start is rejected. A
-nested EXPLAIN sets it in a nesting level of the settings, so at its
-end the token of the outer statement is back for the outer workers.
+setting `pg_pmu.cell`, and the sets the statement counts in the
+hidden setting `pg_pmu.events`, a mask of them. PostgreSQL copies
+settings into every worker it starts, so no other channel is needed.
+A worker opens and counts the same sets, and adds all six sums: those
+of a set it does not count are zero. A nested statement passes the
+sets of every counting statement around it too, since the cells of
+its workers are handed down to those: a statement around that counts
+the cache gets the cache of the nested workers, whatever the nested
+statement prints. Users cannot change the
+settings: they are connection-start settings, so `SET` and `RESET`
+fail with 55P02, and a value given at connection start is rejected. A
+nested EXPLAIN sets them in a nesting level of the settings, so at
+its end the token and the sets of the outer statement are back for
+the outer workers.
 
 ### The life of a cell
 
@@ -282,7 +330,9 @@ system that cannot count fails before the statement runs.
 - 42501: the system forbids counting (Linux `perf_event_paranoid`,
   capabilities, a container's seccomp filter); the hint names these.
 - 0A000: no counters here: a virtual machine, a system other than
-  Linux and macOS, core types that cannot all be counted.
+  Linux and macOS, core types that cannot all be counted, or a set
+  asked for that the system cannot count, as the branches and the
+  cache on macOS.
 - 53000: no free hardware counter, no file descriptor, a counter lost
   during the statement, no free cell in the pool.
 - XX000: an unexpected error of a system call, or a bug in pg_pmu,
@@ -355,6 +405,16 @@ compile time.
 - **`inherit_thread`, to leave child processes out.** It needs Linux
   5.13, and the processes a backend starts are rare and part of its
   work.
+- **All six events in one group.** A machine without six free
+  counters would then count nothing at all, instructions included.
+- **Every set opened at the first counting statement.** It would hold
+  descriptors, and on a machine with few counters fail statements
+  that ask only for instructions.
+- **Zeros for the sets macOS cannot count.** A zero reads as a count:
+  no misses at all. The statement fails instead.
+- **The levels of the cache by name** (`PERF_TYPE_HW_CACHE`, the first
+  level and the last). Their meaning is the same on every processor,
+  but many cores of Arm have no event for the last level.
 
 ## Limitations
 
@@ -366,7 +426,11 @@ compile time.
 - More nested counting statements at once than `pg_pmu.max_nested`
   fail with 53000.
 - On Linux, a copy of a group in a thread started later can lose
-  counts unseen; before Linux 4.13 such threads are not counted.
+  counts unseen; before Linux 4.13 such threads are not counted, and
+  each set counts the threads listed when it opened.
+- The level of the cache counted depends on the processor, and the
+  branches and the cache change from run to run more than
+  instructions do.
 - On a hybrid Intel CPU we assume the kernel skips a pinned group on
   the other core type rather than putting it into the error state.
   This needs checking on such a machine.

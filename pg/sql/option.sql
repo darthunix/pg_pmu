@@ -11,9 +11,22 @@ EXPLAIN (PMU true, ANALYZE false) SELECT 1;
 \set VERBOSITY default
 EXPLAIN (PMU) SELECT 1;
 
--- The option takes the values of the boolean options of PostgreSQL.
-\set VERBOSITY sqlstate
+-- The option takes the values of the boolean options of PostgreSQL,
+-- and branches, cache or full, in any case; any other value is refused.
+-- Each value that counts needs ANALYZE, so it fails here after it was
+-- taken; the last value given counts.
 EXPLAIN (PMU maybe) SELECT 1;
+\set VERBOSITY terse
+EXPLAIN (PMU 2) SELECT 1;
+EXPLAIN (PMU branches) SELECT 1;
+EXPLAIN (PMU Cache) SELECT 1;
+EXPLAIN (PMU FULL) SELECT 1;
+EXPLAIN (PMU 'branches') SELECT 1;
+EXPLAIN (PMU on) SELECT 1;
+EXPLAIN (PMU 1) SELECT 1;
+EXPLAIN (PMU 'all') SELECT 1;
+EXPLAIN (PMU branches, PMU off) SELECT 1;
+EXPLAIN (PMU off, PMU branches) SELECT 1;
 \set VERBOSITY default
 
 EXPLAIN (ANALYZE, PMU off, COSTS off, TIMING off, SUMMARY off,
@@ -51,7 +64,19 @@ CREATE FUNCTION set_cell() RETURNS int LANGUAGE sql
   SET pg_pmu.cell = 1 AS 'SELECT 1';
 ALTER ROLE CURRENT_USER SET pg_pmu.cell = 1;
 ALTER SYSTEM SET pg_pmu.cell = 1;
+SET pg_pmu.events = 7;
+BEGIN;
+SET LOCAL pg_pmu.events = 7;
+ROLLBACK;
+RESET pg_pmu.events;
+SELECT set_config('pg_pmu.events', '7', false);
+CREATE FUNCTION set_events() RETURNS int LANGUAGE sql
+  SET pg_pmu.events = 7 AS 'SELECT 1';
+ALTER ROLE CURRENT_USER SET pg_pmu.events = 7;
+ALTER SYSTEM SET pg_pmu.events = 7;
 \set VERBOSITY default
 RESET ALL;
 SHOW pg_pmu.cell;
-SELECT count(*) AS listed FROM pg_settings WHERE name = 'pg_pmu.cell';
+SHOW pg_pmu.events;
+SELECT count(*) AS listed FROM pg_settings
+WHERE name IN ('pg_pmu.cell', 'pg_pmu.events');
