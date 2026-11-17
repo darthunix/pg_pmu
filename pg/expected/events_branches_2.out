@@ -1,0 +1,198 @@
+-- The branches, and the branches the processor
+-- mispredicted, beside instructions and cycles, which a counting EXPLAIN
+-- counts with PMU branches: two more counters of a core, four in all. A
+-- system that counts them gives this output, Linux on a processor with
+-- a PMU. One that counts only instructions and cycles gives
+-- events_branches_1.out: macOS, or a virtual machine whose host hides
+-- these events, where each counting EXPLAIN that asks for them prints
+-- "cannot count" and each fact taken from their counts is empty. One
+-- that counts nothing, as a virtual machine without a PMU or a build
+-- without counters, gives events_branches_2.out, where every counting
+-- EXPLAIN prints it. The helpers are those of the other suites of
+-- events, so that each runs alone.
+-- Run an EXPLAIN and return its lines, with the numbers of the lines of
+-- pg_pmu replaced by N; or one line when the system cannot count.
+CREATE OR REPLACE FUNCTION pmu_lines(query text) RETURNS SETOF text
+LANGUAGE plpgsql AS $$
+DECLARE
+  line text;
+BEGIN
+  FOR line IN EXECUTE query LOOP
+    RETURN NEXT CASE WHEN line ~ 'PMU'
+                     THEN regexp_replace(line, '[0-9]+', 'N', 'g')
+                     ELSE line END;
+  END LOOP;
+EXCEPTION
+  WHEN OTHERS THEN
+    IF SQLSTATE IN ('42501', '0A000', '53000') THEN
+      RETURN NEXT 'cannot count';
+    ELSE
+      RAISE;
+    END IF;
+END
+$$;
+-- The document of an EXPLAIN in JSON, or NULL when the system cannot
+-- count.
+CREATE OR REPLACE FUNCTION pmu_doc(query text) RETURNS jsonb
+LANGUAGE plpgsql AS $$
+DECLARE
+  doc text;
+BEGIN
+  EXECUTE query INTO doc;
+  RETURN doc::jsonb -> 0;
+EXCEPTION
+  WHEN OTHERS THEN
+    IF SQLSTATE IN ('42501', '0A000', '53000') THEN
+      RETURN NULL;
+    ELSE
+      RAISE;
+    END IF;
+END
+$$;
+-- An EXPLAIN with the value of PMU given, of a count of the table tab,
+-- inside the statement that calls it: the NOTICE shows its line of the
+-- execution.
+CREATE OR REPLACE FUNCTION inner_events(pmu text, tab text) RETURNS int
+LANGUAGE plpgsql AS $$
+DECLARE
+  line text;
+BEGIN
+  FOR line IN EXECUTE format('EXPLAIN (ANALYZE, PMU %s, COSTS off, TIMING off,
+                                       SUMMARY off, BUFFERS off)
+                              SELECT count(*) FROM %I', pmu, tab) LOOP
+    IF line ~ '^Execution PMU' THEN
+      RAISE NOTICE 'inner: %', regexp_replace(line, '[0-9]+', 'N', 'g');
+    END IF;
+  END LOOP;
+  RETURN 1;
+END
+$$;
+-- Plans without parallel workers or JIT, until the part on workers.
+SET max_parallel_workers_per_gather = 0;
+SET jit = off;
+CREATE TABLE ev_branches AS SELECT g FROM generate_series(1, 100000) g;
+ANALYZE ev_branches;
+-- A statement counts only its own sets. First in this backend: the
+-- branches open inside a statement that counts instructions and
+-- cycles, which go on counting, so that it includes the work of the
+-- nested one; it prints only its own sets.
+CREATE TEMP TABLE inner_part (instructions numeric);
+CREATE FUNCTION branches_inside() RETURNS int
+LANGUAGE plpgsql AS $$
+BEGIN
+  INSERT INTO inner_part
+    SELECT (j ->> 'Execution Instructions')::numeric
+    FROM pmu_doc('EXPLAIN (ANALYZE, PMU branches, FORMAT JSON)
+                  SELECT count(*) FROM ev_branches') AS j;
+  RETURN 1;
+END
+$$;
+CREATE TEMP TABLE outer_doc AS
+  SELECT pmu_doc($$EXPLAIN (ANALYZE, PMU, FORMAT JSON)
+                   SELECT branches_inside()$$) AS j;
+SELECT (o.j ->> 'Execution Instructions')::numeric > i.instructions
+       AS includes_the_nested_one
+FROM outer_doc AS o, inner_part AS i;
+ includes_the_nested_one 
+-------------------------
+(0 rows)
+
+SELECT * FROM pmu_lines($$
+  EXPLAIN (ANALYZE, PMU, COSTS off, TIMING off, SUMMARY off, BUFFERS off)
+  SELECT inner_events('branches', 'ev_branches')$$);
+  pmu_lines   
+--------------
+ cannot count
+(1 row)
+
+-- The value prints its pair beside instructions and cycles, in
+-- planning and in execution; PMU alone prints none.
+SELECT * FROM pmu_lines($$
+  EXPLAIN (ANALYZE, PMU branches, COSTS off, TIMING off, SUMMARY off,
+           BUFFERS off)
+  SELECT count(*) FROM ev_branches$$);
+  pmu_lines   
+--------------
+ cannot count
+(1 row)
+
+SELECT * FROM pmu_lines($$
+  EXPLAIN (ANALYZE, PMU, COSTS off, TIMING off, SUMMARY off, BUFFERS off)
+  SELECT count(*) FROM ev_branches$$);
+  pmu_lines   
+--------------
+ cannot count
+(1 row)
+
+-- The other formats name each count.
+SELECT k FROM jsonb_object_keys(pmu_doc($$
+  EXPLAIN (ANALYZE, PMU branches, FORMAT JSON)
+  SELECT count(*) FROM ev_branches$$)) AS k
+WHERE k ~ '^(Planning|Execution) ' AND k !~ 'Time$'
+ORDER BY k COLLATE "C";
+ k 
+---
+(0 rows)
+
+-- Where the system cannot count them, the statement fails before it
+-- runs: the sequence, which a rollback does not move back, is not
+-- advanced.
+CREATE SEQUENCE branches_s;
+SELECT * FROM pmu_lines($$
+  EXPLAIN (ANALYZE, PMU branches, COSTS off, TIMING off, SUMMARY off,
+           BUFFERS off)
+  SELECT nextval('branches_s')$$);
+  pmu_lines   
+--------------
+ cannot count
+(1 row)
+
+SELECT is_called FROM branches_s;
+ is_called 
+-----------
+ f
+(1 row)
+
+-- What the counts must be: a scan of 100000 rows takes more branches
+-- than rows and fewer than instructions, and the processor mispredicts
+-- only some of them.
+SELECT (j ->> 'Execution Branches')::numeric >= 100000 AS a_branch_a_row,
+       (j ->> 'Execution Branches')::numeric
+         < (j ->> 'Execution Instructions')::numeric AS fewer_than_instructions,
+       (j ->> 'Execution Branch Misses')::numeric
+         < (j ->> 'Execution Branches')::numeric AS some_mispredicted
+FROM pmu_doc($$EXPLAIN (ANALYZE, PMU branches, FORMAT JSON)
+               SELECT count(*) FROM ev_branches$$) AS j;
+ a_branch_a_row | fewer_than_instructions | some_mispredicted 
+----------------+-------------------------+-------------------
+                |                         | 
+(1 row)
+
+-- The parallel workers count the branches of their statement, and their
+-- part is within the counts of the execution.
+RESET max_parallel_workers_per_gather;
+SET parallel_setup_cost = 0;
+SET parallel_tuple_cost = 0;
+SET min_parallel_table_scan_size = 0;
+SET parallel_leader_participation = off;
+SELECT jsonb_path_query_first(j, '$.**."Workers Launched"')::int > 0
+         AS launched,
+       (j ->> 'Workers Branches')::numeric > 0 AS branches_counted,
+       (j ->> 'Workers Branches')::numeric
+         <= (j ->> 'Execution Branches')::numeric AS within
+FROM pmu_doc($$EXPLAIN (ANALYZE, PMU branches, VERBOSE, FORMAT JSON)
+               SELECT count(*) FROM ev_branches$$) AS j;
+ launched | branches_counted | within 
+----------+------------------+--------
+          |                  | 
+(1 row)
+
+SELECT * FROM pmu_lines($$
+  EXPLAIN (ANALYZE, PMU branches, VERBOSE, COSTS off, TIMING off,
+           SUMMARY off, BUFFERS off)
+  SELECT count(*) FROM ev_branches$$) AS line WHERE line ~ 'PMU:';
+ line 
+------
+(0 rows)
+
+RESET parallel_leader_participation;

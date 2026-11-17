@@ -11,10 +11,40 @@ ERROR:  22023
 \set VERBOSITY default
 EXPLAIN (PMU) SELECT 1;
 ERROR:  EXPLAIN option PMU requires ANALYZE
--- The option takes the values of the boolean options of PostgreSQL.
-\set VERBOSITY sqlstate
+-- The option takes the values of the boolean options of PostgreSQL,
+-- and branches, cache or full, in any case; any other value is refused.
+-- Each value that counts needs ANALYZE, so it fails here after it was
+-- taken; the last value given counts.
 EXPLAIN (PMU maybe) SELECT 1;
-ERROR:  42601
+ERROR:  unrecognized value for EXPLAIN option "pmu": "maybe"
+LINE 1: EXPLAIN (PMU maybe) SELECT 1;
+                 ^
+HINT:  It takes a Boolean value, branches, cache or full.
+\set VERBOSITY terse
+EXPLAIN (PMU 2) SELECT 1;
+ERROR:  unrecognized value for EXPLAIN option "pmu": "2" at character 10
+EXPLAIN (PMU branches) SELECT 1;
+ERROR:  EXPLAIN option PMU requires ANALYZE
+EXPLAIN (PMU Cache) SELECT 1;
+ERROR:  EXPLAIN option PMU requires ANALYZE
+EXPLAIN (PMU FULL) SELECT 1;
+ERROR:  EXPLAIN option PMU requires ANALYZE
+EXPLAIN (PMU 'branches') SELECT 1;
+ERROR:  EXPLAIN option PMU requires ANALYZE
+EXPLAIN (PMU on) SELECT 1;
+ERROR:  EXPLAIN option PMU requires ANALYZE
+EXPLAIN (PMU 1) SELECT 1;
+ERROR:  EXPLAIN option PMU requires ANALYZE
+EXPLAIN (PMU 'all') SELECT 1;
+ERROR:  unrecognized value for EXPLAIN option "pmu": "all" at character 10
+EXPLAIN (PMU branches, PMU off) SELECT 1;
+                QUERY PLAN                
+------------------------------------------
+ Result  (cost=0.00..0.01 rows=1 width=4)
+(1 row)
+
+EXPLAIN (PMU off, PMU branches) SELECT 1;
+ERROR:  EXPLAIN option PMU requires ANALYZE
 \set VERBOSITY default
 EXPLAIN (ANALYZE, PMU off, COSTS off, TIMING off, SUMMARY off,
          BUFFERS off) SELECT 1;
@@ -85,6 +115,23 @@ ALTER ROLE CURRENT_USER SET pg_pmu.cell = 1;
 ERROR:  55P02
 ALTER SYSTEM SET pg_pmu.cell = 1;
 ERROR:  55P02
+SET pg_pmu.events = 7;
+ERROR:  55P02
+BEGIN;
+SET LOCAL pg_pmu.events = 7;
+ERROR:  55P02
+ROLLBACK;
+RESET pg_pmu.events;
+ERROR:  55P02
+SELECT set_config('pg_pmu.events', '7', false);
+ERROR:  55P02
+CREATE FUNCTION set_events() RETURNS int LANGUAGE sql
+  SET pg_pmu.events = 7 AS 'SELECT 1';
+ERROR:  55P02
+ALTER ROLE CURRENT_USER SET pg_pmu.events = 7;
+ERROR:  55P02
+ALTER SYSTEM SET pg_pmu.events = 7;
+ERROR:  55P02
 \set VERBOSITY default
 RESET ALL;
 SHOW pg_pmu.cell;
@@ -93,7 +140,14 @@ SHOW pg_pmu.cell;
  0
 (1 row)
 
-SELECT count(*) AS listed FROM pg_settings WHERE name = 'pg_pmu.cell';
+SHOW pg_pmu.events;
+ pg_pmu.events 
+---------------
+ 0
+(1 row)
+
+SELECT count(*) AS listed FROM pg_settings
+WHERE name IN ('pg_pmu.cell', 'pg_pmu.events');
  listed 
 --------
       0

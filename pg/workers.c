@@ -8,8 +8,8 @@
  * pg_pmu.max_nested cells for nested statements; the crate owns its
  * layout and every step on a cell. A counting statement takes a cell,
  * the cell of its backend when it is the outermost one, and saves its
- * token in the setting pg_pmu.cell, which PostgreSQL copies into the
- * statement's workers.
+ * token in the setting pg_pmu.cell and the sets of events it counts in
+ * pg_pmu.events, which PostgreSQL copies into the statement's workers.
  *
  * A taken cell is held apart from the statement. At the normal end of
  * the statement its workers have exited, and the cell goes back at
@@ -62,7 +62,10 @@ static int	pmu_max_nested = 16;
 /* pg_pmu.cell: the token of the cell of the counting statement, or 0 */
 static char *pmu_cell = NULL;
 
-/* The module itself is changing pg_pmu.cell. */
+/* pg_pmu.events: the sets of events of the counting statement */
+static int	pmu_events = 0;
+
+/* The module itself is changing pg_pmu.cell and pg_pmu.events. */
 static bool pmu_setting_cell = false;
 
 /* The memory "pg_pmu", mapped by PostgreSQL in each process. */
@@ -84,7 +87,9 @@ static bool pmu_worker_exit_set = false;
 
 static void pmu_shmem_request(void *arg);
 static void pmu_shmem_init(void *arg);
+static bool pmu_setting_allowed(const char *name, GucSource source);
 static bool pmu_cell_check(char **newval, void **extra, GucSource source);
+static bool pmu_events_check(int *newval, void **extra, GucSource source);
 static int32 pmu_worker_report_counts(const PmuCounts *now);
 static void pmu_hand_down(const PmuCellContents *contents);
 static void pmu_give_back_on_abort(void);
@@ -132,6 +137,17 @@ pmu_workers_init(void)
 							   GUC_NO_SHOW_ALL | GUC_NOT_IN_SAMPLE |
 							   GUC_DISALLOW_IN_FILE,
 							   pmu_cell_check, NULL, NULL);
+	DefineCustomIntVariable("pg_pmu.events",
+							"The sets of events the workers of a counting statement count.",
+							"For the use of pg_pmu only.",
+							&pmu_events,
+							0, 0,
+							PMU_EVENTS_BASIC | PMU_EVENTS_BRANCHES |
+							PMU_EVENTS_CACHE,
+							PGC_BACKEND,
+							GUC_NO_SHOW_ALL | GUC_NOT_IN_SAMPLE |
+							GUC_DISALLOW_IN_FILE,
+							pmu_events_check, NULL, NULL);
 
 	RegisterXactCallback(pmu_xact_callback, NULL);
 	RegisterSubXactCallback(pmu_subxact_callback, NULL);
@@ -169,34 +185,47 @@ pmu_shmem_init(void *arg)
 }
 
 /*
- * Only the module changes pg_pmu.cell, and PostgreSQL copies it into a
- * worker while the worker starts; a value given at the start of a
- * connection is refused.
+ * Only the module changes pg_pmu.cell and pg_pmu.events, and PostgreSQL
+ * copies them into a worker while the worker starts; a value given at
+ * the start of a connection is refused.
  */
 static bool
-pmu_cell_check(char **newval, void **extra, GucSource source)
+pmu_setting_allowed(const char *name, GucSource source)
 {
 	if (pmu_setting_cell || InitializingParallelWorker ||
 		source == PGC_S_DEFAULT)
 		return true;
 	GUC_check_errcode(ERRCODE_INVALID_PARAMETER_VALUE);
-	GUC_check_errmsg("parameter \"%s\" is for the use of pg_pmu only",
-					 "pg_pmu.cell");
+	GUC_check_errmsg("parameter \"%s\" is for the use of pg_pmu only", name);
 	return false;
 }
 
+static bool
+pmu_cell_check(char **newval, void **extra, GucSource source)
+{
+	return pmu_setting_allowed("pg_pmu.cell", source);
+}
+
+static bool
+pmu_events_check(int *newval, void **extra, GucSource source)
+{
+	return pmu_setting_allowed("pg_pmu.events", source);
+}
+
 /*
- * Take a cell for a statement that starts to count, hold it, and save
- * its token in pg_pmu.cell, in a new nesting level of the settings that
- * the caller ends with pmu_return_cell; on an error the abort of the
- * transaction ends it. A parallel worker launches no workers, so it
- * takes no cell: it returns NULL and sets *guc_level to 0.
+ * Take a cell for a statement that starts to count the sets of events
+ * `sets`, hold it, and save its token in pg_pmu.cell and the sets in
+ * pg_pmu.events, in a new nesting level of the settings that the caller
+ * ends with pmu_return_cell; on an error the abort of the transaction
+ * ends it. A parallel worker launches no workers, so it takes no cell:
+ * it returns NULL and sets *guc_level to 0.
  */
 PmuHold *
-pmu_take_cell(int *guc_level)
+pmu_take_cell(uint32 sets, int *guc_level)
 {
 	PmuHold    *hold;
 	char		value[PMU_TOKEN_LEN];
+	char		events[12];
 	int32		status;
 
 	*guc_level = 0;
@@ -243,11 +272,15 @@ pmu_take_cell(int *guc_level)
 	pmu_holds = hold;
 
 	snprintf(value, sizeof(value), UINT64_FORMAT, hold->token);
+	snprintf(events, sizeof(events), "%u", sets);
 	*guc_level = NewGUCNestLevel();
 	pmu_setting_cell = true;
 	PG_TRY();
 	{
 		(void) set_config_option("pg_pmu.cell", value, PGC_BACKEND,
+								 PGC_S_SESSION, GUC_ACTION_SAVE, true, 0,
+								 false);
+		(void) set_config_option("pg_pmu.events", events, PGC_BACKEND,
 								 PGC_S_SESSION, GUC_ACTION_SAVE, true, 0,
 								 false);
 	}
@@ -363,15 +396,15 @@ pmu_hold_read(PmuHold *hold, PmuCellContents *out)
  * The start of a worker's execution of the plan: its rows go to the
  * tuple queue of the Gather. Other queries of the worker, and the
  * workers of a parallel index build, are not counted. A worker whose
- * statement counts takes its token from pg_pmu.cell, opens its counters
- * and takes a reference to them; when it cannot, it reports its failure
- * and raises the error.
+ * statement counts takes its token from pg_pmu.cell and the sets of
+ * events from pg_pmu.events, opens their counters and takes a reference
+ * to each; when it cannot, it reports its failure and raises the error.
  */
 void
 pmu_worker_start(QueryDesc *queryDesc)
 {
 	uint64		token;
-	uint32		sets = PMU_EVENTS_BASIC;
+	uint32		sets = (uint32) pmu_events;
 	int32		status;
 
 	if (!IsParallelWorker() || pmu_worker_counting ||
@@ -388,6 +421,9 @@ pmu_worker_start(QueryDesc *queryDesc)
 	{
 		int32		os_error = 0;
 
+		/* The statement counts the basic set always. */
+		if ((sets & PMU_EVENTS_BASIC) == 0)
+			pmu_report(PMU_INTERNAL, 0);
 		pmu_open_counters(sets);
 #ifdef PMU_TEST_WORKERS_CANNOT_COUNT
 		/* The build of the suite workers_cannot_count. */

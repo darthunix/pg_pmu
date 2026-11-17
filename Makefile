@@ -47,10 +47,16 @@ endif
 PMU_VARIANT = $(PMU_COUNTERS)$(if $(PG_PMU_TEST), $(PG_PMU_TEST))
 
 # The suites with a second expected output for a system that cannot
-# count; "make installcheck-counted" demands the first.
+# count; "make installcheck-counted" demands the first. The suites of
+# the branches and the cache demand it too with PG_PMU_REQUIRE_EVENTS,
+# on a machine that counts them all at once: macOS never does, and
+# virtual machines may hide them.
 COUNTED_SUITES = counters
+ifneq ($(PG_PMU_REQUIRE_EVENTS),)
+COUNTED_SUITES += events_branches events_cache events_full
+endif
 
-REGRESS = option counters
+REGRESS = option counters events_branches events_cache events_full
 REGRESS_OPTS = --inputdir=$(srcdir)/pg --temp-config=$(srcdir)/pg/pg_pmu.conf
 
 PG_CONFIG ?= pg_config

@@ -28,7 +28,7 @@ extern void pmu_open_counters(uint32 sets);
 
 /* In workers.c: the cells, and the counting in a worker. */
 extern void pmu_workers_init(void);
-extern PmuHold *pmu_take_cell(int *guc_level);
+extern PmuHold *pmu_take_cell(uint32 sets, int *guc_level);
 extern void pmu_return_cell(PmuHold *hold, int guc_level);
 extern void pmu_hold_read(PmuHold *hold, PmuCellContents *out);
 extern void pmu_worker_start(QueryDesc *queryDesc);

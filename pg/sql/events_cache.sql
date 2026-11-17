@@ -1,0 +1,168 @@
+-- The references to the cache and its
+-- misses, beside instructions and cycles, which a counting EXPLAIN
+-- counts with PMU cache: two more counters of a core, four in all. A
+-- system that counts them gives this output, Linux on a processor with
+-- a PMU. One that counts only instructions and cycles gives
+-- events_cache_1.out: macOS, or a virtual machine whose host hides
+-- these events, where each counting EXPLAIN that asks for them prints
+-- "cannot count" and each fact taken from their counts is empty. One
+-- that counts nothing, as a virtual machine without a PMU or a build
+-- without counters, gives events_cache_2.out, where every counting
+-- EXPLAIN prints it. The helpers are those of the other suites of
+-- events, so that each runs alone.
+
+-- Run an EXPLAIN and return its lines, with the numbers of the lines of
+-- pg_pmu replaced by N; or one line when the system cannot count.
+CREATE OR REPLACE FUNCTION pmu_lines(query text) RETURNS SETOF text
+LANGUAGE plpgsql AS $$
+DECLARE
+  line text;
+BEGIN
+  FOR line IN EXECUTE query LOOP
+    RETURN NEXT CASE WHEN line ~ 'PMU'
+                     THEN regexp_replace(line, '[0-9]+', 'N', 'g')
+                     ELSE line END;
+  END LOOP;
+EXCEPTION
+  WHEN OTHERS THEN
+    IF SQLSTATE IN ('42501', '0A000', '53000') THEN
+      RETURN NEXT 'cannot count';
+    ELSE
+      RAISE;
+    END IF;
+END
+$$;
+
+-- The document of an EXPLAIN in JSON, or NULL when the system cannot
+-- count.
+CREATE OR REPLACE FUNCTION pmu_doc(query text) RETURNS jsonb
+LANGUAGE plpgsql AS $$
+DECLARE
+  doc text;
+BEGIN
+  EXECUTE query INTO doc;
+  RETURN doc::jsonb -> 0;
+EXCEPTION
+  WHEN OTHERS THEN
+    IF SQLSTATE IN ('42501', '0A000', '53000') THEN
+      RETURN NULL;
+    ELSE
+      RAISE;
+    END IF;
+END
+$$;
+
+-- An EXPLAIN with the value of PMU given, of a count of the table tab,
+-- inside the statement that calls it: the NOTICE shows its line of the
+-- execution.
+CREATE OR REPLACE FUNCTION inner_events(pmu text, tab text) RETURNS int
+LANGUAGE plpgsql AS $$
+DECLARE
+  line text;
+BEGIN
+  FOR line IN EXECUTE format('EXPLAIN (ANALYZE, PMU %s, COSTS off, TIMING off,
+                                       SUMMARY off, BUFFERS off)
+                              SELECT count(*) FROM %I', pmu, tab) LOOP
+    IF line ~ '^Execution PMU' THEN
+      RAISE NOTICE 'inner: %', regexp_replace(line, '[0-9]+', 'N', 'g');
+    END IF;
+  END LOOP;
+  RETURN 1;
+END
+$$;
+
+-- Plans without parallel workers or JIT, until the part on workers.
+SET max_parallel_workers_per_gather = 0;
+SET jit = off;
+CREATE TABLE ev_cache AS SELECT g FROM generate_series(1, 100000) g;
+ANALYZE ev_cache;
+
+-- A statement counts only its own sets. First in this backend: the
+-- cache opens inside a statement that counts instructions and cycles,
+-- which go on counting, so that it includes the work of the nested
+-- one; and one inside that asks for fewer prints only its own.
+CREATE TEMP TABLE inner_part (instructions numeric);
+CREATE FUNCTION cache_inside() RETURNS int
+LANGUAGE plpgsql AS $$
+BEGIN
+  INSERT INTO inner_part
+    SELECT (j ->> 'Execution Instructions')::numeric
+    FROM pmu_doc('EXPLAIN (ANALYZE, PMU cache, FORMAT JSON)
+                  SELECT count(*) FROM ev_cache') AS j;
+  RETURN 1;
+END
+$$;
+CREATE TEMP TABLE outer_doc AS
+  SELECT pmu_doc($$EXPLAIN (ANALYZE, PMU, FORMAT JSON)
+                   SELECT cache_inside()$$) AS j;
+SELECT (o.j ->> 'Execution Instructions')::numeric > i.instructions
+       AS includes_the_nested_one
+FROM outer_doc AS o, inner_part AS i;
+SELECT * FROM pmu_lines($$
+  EXPLAIN (ANALYZE, PMU cache, COSTS off, TIMING off, SUMMARY off,
+           BUFFERS off)
+  SELECT inner_events('on', 'ev_cache')$$);
+
+-- The value prints its pair beside instructions and cycles, in
+-- planning and in execution, in any case.
+SELECT * FROM pmu_lines($$
+  EXPLAIN (ANALYZE, PMU 'Cache', COSTS off, TIMING off, SUMMARY off,
+           BUFFERS off)
+  SELECT count(*) FROM ev_cache$$);
+
+-- The other formats name each count.
+SELECT k FROM jsonb_object_keys(pmu_doc($$
+  EXPLAIN (ANALYZE, PMU cache, FORMAT JSON) SELECT count(*) FROM ev_cache$$))
+  AS k
+WHERE k ~ '^(Planning|Execution) ' AND k !~ 'Time$'
+ORDER BY k COLLATE "C";
+
+-- Where the system cannot count them, the statement fails before it
+-- runs.
+CREATE SEQUENCE cache_s;
+SELECT * FROM pmu_lines($$
+  EXPLAIN (ANALYZE, PMU cache, COSTS off, TIMING off, SUMMARY off,
+           BUFFERS off)
+  SELECT nextval('cache_s')$$);
+SELECT is_called FROM cache_s;
+
+-- A scan refers to the cache.
+SELECT (j ->> 'Execution Cache References')::numeric > 0 AS cache_referred
+FROM pmu_doc($$EXPLAIN (ANALYZE, PMU cache, FORMAT JSON)
+               SELECT count(*) FROM ev_cache$$) AS j;
+
+-- The parallel workers count the cache of their statement.
+RESET max_parallel_workers_per_gather;
+SET parallel_setup_cost = 0;
+SET parallel_tuple_cost = 0;
+SET min_parallel_table_scan_size = 0;
+SET parallel_leader_participation = off;
+SELECT (j ->> 'Workers Cache References')::numeric > 0 AS cache_counted
+FROM pmu_doc($$EXPLAIN (ANALYZE, PMU cache, VERBOSE, FORMAT JSON)
+               SELECT count(*) FROM ev_cache$$) AS j;
+
+-- The workers of a nested statement count the sets of the statement
+-- around too, which gets their counts when the nested one ends: a
+-- serial statement that asks for the cache, around a parallel one that
+-- asks for instructions and cycles only, has the workers' part of
+-- both, the instructions exactly those of the nested one.
+CREATE TEMP TABLE nested_workers (instructions numeric);
+CREATE FUNCTION nested_parallel() RETURNS int
+LANGUAGE plpgsql AS $$
+BEGIN
+  INSERT INTO nested_workers
+    SELECT (j ->> 'Workers Instructions')::numeric
+    FROM pmu_doc('EXPLAIN (ANALYZE, PMU, VERBOSE, FORMAT JSON)
+                  SELECT count(*) FROM ev_cache') AS j;
+  RETURN 1;
+END
+$$;
+CREATE TEMP TABLE serial_doc AS
+  SELECT pmu_doc($$EXPLAIN (ANALYZE, PMU cache, VERBOSE, FORMAT JSON)
+                   SELECT nested_parallel()$$) AS j;
+SELECT (o.j ->> 'Workers Instructions')::numeric = n.instructions
+         AS the_nested_part_once,
+       (o.j ->> 'Workers Cache References')::numeric > 0
+         AS their_cache_counted
+FROM serial_doc AS o, nested_workers AS n;
+RESET parallel_leader_participation;
