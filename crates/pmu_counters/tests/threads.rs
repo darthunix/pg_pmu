@@ -21,7 +21,7 @@ use std::sync::mpsc;
 use std::thread;
 
 use common::{counters, work};
-use pmu_counters::counters::{Counters, Platform};
+use pmu_counters::counters::{Counters, Platform, Set};
 
 const N: u64 = 10_000_000;
 
@@ -75,10 +75,11 @@ impl Worker {
 /// The instructions of one statement: a reference taken, `f` run, the
 /// counters read, the reference given back.
 fn statement(c: &mut Counters<Platform>, f: impl FnOnce()) -> u64 {
-    let start = c.acquire().unwrap();
+    let basic = Set::Basic.bit();
+    let start = c.acquire(basic).unwrap();
     f();
-    let end = c.read().unwrap();
-    c.release().unwrap();
+    let end = c.read(basic).unwrap();
+    c.release(basic).unwrap();
     end.instructions - start.instructions
 }
 

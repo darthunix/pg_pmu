@@ -25,7 +25,7 @@ two plans, two settings, two executors. How the module works is in
   option; while an EXPLAIN runs, the hooks add a little bookkeeping to
   each query it runs, which a counting statement counts too.
 - Nothing to create in the database, and shared memory of a size fixed
-  at start, about 5 KB with default settings.
+  at start, about 10 KB with default settings.
 - A count is right or the statement fails. Never a plausible wrong
   number.
 

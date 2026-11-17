@@ -45,6 +45,9 @@ pub enum Status {
     BadToken = 15,
     /// 0A000: more threads run in the process than the crate counts on.
     TooManyThreads = 16,
+    /// 0A000: the system cannot count the events of a set other than
+    /// the basic one: macOS, or a processor or kernel without them.
+    EventsNotCounted = 17,
 }
 
 /// A code with the error of the system, `errno`, where there is one,

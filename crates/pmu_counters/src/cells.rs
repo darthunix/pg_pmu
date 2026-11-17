@@ -22,6 +22,7 @@ use loom::sync::atomic::{AtomicU32, AtomicU64};
 use core::sync::atomic::Ordering::SeqCst;
 
 use crate::Status;
+use crate::counters::{Counts, VALUES};
 use crate::sysfs::Malformed;
 
 /// Bits of the writers, and of the number of a cell in a token.
@@ -52,10 +53,9 @@ pub struct Header {
 #[repr(C)]
 #[derive(Debug, Default)]
 pub struct Cell {
-    /// The instructions the workers added.
-    pub instructions: AtomicU64,
-    /// The cycles the workers added.
-    pub cycles: AtomicU64,
+    /// The counts the workers added, in the order of the fields of
+    /// [`Counts`].
+    pub sums: [AtomicU64; VALUES],
     /// The generation and the writers.
     pub state: AtomicU64,
     /// The workers that could not count.
@@ -68,10 +68,8 @@ pub struct Cell {
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Contents {
-    /// The instructions the workers added.
-    pub instructions: u64,
-    /// The cycles the workers added.
-    pub cycles: u64,
+    /// The counts the workers added.
+    pub counts: Counts,
     /// The workers that could not count.
     pub failures: u32,
     /// The SQLSTATE of the last of them.
@@ -175,9 +173,10 @@ impl Cell {
     }
 
     /// Add counts, between entering and leaving.
-    pub fn add(&self, instructions: u64, cycles: u64) {
-        self.instructions.fetch_add(instructions, SeqCst);
-        self.cycles.fetch_add(cycles, SeqCst);
+    pub fn add(&self, counts: &Counts) {
+        for (sum, value) in self.sums.iter().zip(counts.to_array()) {
+            sum.fetch_add(value, SeqCst);
+        }
     }
 
     /// Count a worker that could not count, between entering and leaving.
@@ -222,8 +221,7 @@ impl Cell {
 
     fn contents(&self) -> Contents {
         Contents {
-            instructions: self.instructions.load(SeqCst),
-            cycles: self.cycles.load(SeqCst),
+            counts: Counts::from_array(self.sums.each_ref().map(|s| s.load(SeqCst))),
             failures: self.failures.load(SeqCst),
             sqlstate: self.sqlstate.load(SeqCst),
         }
@@ -258,8 +256,7 @@ impl Cell {
             return Err(Status::Internal);
         }
         Ok(Contents {
-            instructions: self.instructions.swap(0, SeqCst),
-            cycles: self.cycles.swap(0, SeqCst),
+            counts: Counts::from_array(self.sums.each_ref().map(|s| s.swap(0, SeqCst))),
             failures: self.failures.swap(0, SeqCst),
             sqlstate: self.sqlstate.swap(0, SeqCst),
         })
@@ -382,16 +379,16 @@ mod proofs {
     /// it, makes the state the design says and leads to an allowed one,
     /// returns what the cell holds where it returns anything, and leaves
     /// the sums as they were, but for emptying, which takes them and
-    /// leaves zeros; a refused step changes nothing.
+    /// leaves zeros; a refused step changes nothing. The bound of the
+    /// loops covers the six sums.
     #[kani::proof]
-    #[kani::unwind(3)]
+    #[kani::unwind(7)]
     fn steps_keep_the_states_of_the_design() {
         let s: u64 = kani::any();
         kani::assume(allowed(s));
         let g: u64 = kani::any();
         let sums = Contents {
-            instructions: kani::any(),
-            cycles: kani::any(),
+            counts: Counts::from_array(kani::any()),
             failures: kani::any(),
             sqlstate: kani::any(),
         };
@@ -400,8 +397,9 @@ mod proofs {
         let mine = taken && sg == g;
         let cell = Cell::default();
         cell.state.store(s, SeqCst);
-        cell.instructions.store(sums.instructions, SeqCst);
-        cell.cycles.store(sums.cycles, SeqCst);
+        for (sum, value) in cell.sums.iter().zip(sums.counts.to_array()) {
+            sum.store(value, SeqCst);
+        }
         cell.failures.store(sums.failures, SeqCst);
         cell.sqlstate.store(sums.sqlstate, SeqCst);
 
@@ -469,13 +467,12 @@ mod tests {
     #[test]
     fn layout_is_that_of_the_design() {
         assert_eq!(size_of::<Header>(), 16);
-        assert_eq!(size_of::<Cell>(), 32);
-        assert_eq!(offset_of!(Cell, instructions), 0);
-        assert_eq!(offset_of!(Cell, cycles), 8);
-        assert_eq!(offset_of!(Cell, state), 16);
-        assert_eq!(offset_of!(Cell, failures), 24);
-        assert_eq!(offset_of!(Cell, sqlstate), 28);
-        assert_eq!(size(136, 16), Some(4880));
+        assert_eq!(size_of::<Cell>(), 64);
+        assert_eq!(offset_of!(Cell, sums), 0);
+        assert_eq!(offset_of!(Cell, state), 48);
+        assert_eq!(offset_of!(Cell, failures), 56);
+        assert_eq!(offset_of!(Cell, sqlstate), 60);
+        assert_eq!(size(136, 16), Some(9744));
     }
 
     #[test]
@@ -485,11 +482,13 @@ mod tests {
         assert_eq!(g, 1);
         assert!(c.take().is_none());
         c.enter(g).unwrap();
-        c.add(10, 20);
+        let counts = Counts::from_array([10, 20, 30, 40, 50, 60]);
+        c.add(&counts);
+        c.add(&counts);
         c.leave().unwrap();
-        assert_eq!(c.read(g).unwrap().instructions, 10);
+        assert_eq!(c.read(g).unwrap().counts.instructions, 20);
         let got = c.give_back(g).unwrap();
-        assert_eq!((got.instructions, got.cycles), (10, 20));
+        assert_eq!(got.counts.to_array(), [20, 40, 60, 80, 100, 120]);
         assert_eq!(c.state(), (2, 0));
         assert_eq!(c.enter(g), Err(Status::StaleToken));
         assert_eq!(c.take(), Some(3));

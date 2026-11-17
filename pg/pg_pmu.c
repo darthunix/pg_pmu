@@ -51,6 +51,7 @@ typedef struct PmuRecord
 	struct PmuRecord *next;
 	QueryDesc  *query;			/* until its end */
 	PlannedStmt *plan;
+	uint32		sets;			/* the sets of events the frame counts */
 	PmuHold    *hold;			/* the cell of the frame's workers, if any */
 	PmuCounts	start;			/* of this process */
 	PmuCounts	finish;
@@ -69,7 +70,8 @@ typedef struct PmuFrame
 	struct PmuFrame *prev;
 	int			depth;			/* the depth of its EXPLAIN */
 	bool		counting;		/* the option PMU is on; it then holds a
-								 * reference to the counters */
+								 * reference to each set it counts */
+	uint32		sets;			/* those sets, PMU_EVENTS_* */
 	PmuHold    *hold;			/* the cell of its workers, if any */
 	int			guc_level;		/* where its setting pg_pmu.cell is saved */
 	MemoryContext cxt;			/* where its records live */
@@ -82,7 +84,8 @@ typedef struct PmuFrame
  */
 typedef struct PmuExplainState
 {
-	bool		pmu;			/* the option PMU is on */
+	uint32		sets;			/* the sets of events of the option PMU, 0
+								 * when it is off */
 	PmuFrame   *frame;			/* its frame, once it counts */
 	PlannedStmt *planned;		/* the plan the planner made last, if any */
 	PmuCounts	plan_start;		/* the counts around that planning */
@@ -126,8 +129,8 @@ static int	pmu_depth = 0;
 /* Our slot in the extension state of an EXPLAIN. */
 static int	pmu_extension_id;
 
-/* The counters of this process are open; they stay so until it exits. */
-static bool pmu_counters_opened = false;
+/* The sets of counters of this process that are open, until it exits. */
+static uint32 pmu_sets_open = 0;
 
 static explain_validate_options_hook_type prev_validate_options_hook = NULL;
 static explain_per_plan_hook_type prev_explain_per_plan_hook = NULL;
@@ -147,12 +150,12 @@ static bool pmu_option_guc_check(const char *option_name,
 								 NodeTag option_type);
 static void pmu_validate_options(ExplainState *es, List *options,
 								 ParseState *pstate);
-static void pmu_read(PmuCounts *now);
+static void pmu_read(uint32 sets, PmuCounts *now);
 static void pmu_frame_pop(PmuFrame *frame, bool report);
 static void pmu_free_records(PmuFrame *frame);
 static PmuRecord *pmu_find_record(QueryDesc *query);
 static void pmu_print(ExplainState *es, const char *phase,
-					  uint64 instructions, uint64 cycles);
+					  const PmuCounts *counts, uint32 sets);
 static void pmu_explain_per_plan(PlannedStmt *plannedstmt, IntoClause *into,
 								 ExplainState *es, const char *queryString,
 								 ParamListInfo params,
@@ -237,12 +240,12 @@ pmu_ensure_state(ExplainState *es)
 
 /*
  * EXPLAIN (PMU [boolean]): takes the values of PostgreSQL's own boolean
- * options.
+ * options, and counts instructions and cycles.
  */
 static void
 pmu_option_handler(ExplainState *es, DefElem *opt, ParseState *pstate)
 {
-	pmu_ensure_state(es)->pmu = defGetBoolean(opt);
+	pmu_ensure_state(es)->sets = defGetBoolean(opt) ? PMU_EVENTS_BASIC : 0;
 }
 
 /*
@@ -274,7 +277,7 @@ pmu_validate_options(ExplainState *es, List *options, ParseState *pstate)
 		prev_validate_options_hook(es, options, pstate);
 
 	state = GetExplainExtensionState(es, pmu_extension_id);
-	if (state == NULL || !state->pmu)
+	if (state == NULL || state->sets == 0)
 		return;
 
 	if (!es->analyze)
@@ -295,20 +298,23 @@ pmu_validate_options(ExplainState *es, List *options, ParseState *pstate)
 						"PMU")));
 
 	/*
-	 * Open the counters now, so that a system where this backend cannot
-	 * count fails the statement before it runs, and take the frame's
-	 * reference, which keeps them counting until the frame ends.
+	 * Open the counters of its sets now, so that a system where this
+	 * backend cannot count them fails the statement before it runs, and
+	 * take the frame's references, which keep them counting until the
+	 * frame ends.
 	 */
-	pmu_open_counters();
+	pmu_open_counters(state->sets);
 	{
 		PmuCounts	now;
 		int32		os_error = 0;
-		int32		status = pmu_counters_acquire(&now, &os_error);
+		int32		status = pmu_counters_acquire(state->sets, &now,
+												  &os_error);
 
 		if (status != PMU_OK)
 			pmu_report(status, os_error);
 	}
 	pmu_frames->counting = true;
+	pmu_frames->sets = state->sets;
 	state->frame = pmu_frames;
 
 	/* The cell of its workers; none left in the pool fails it here. */
@@ -316,13 +322,13 @@ pmu_validate_options(ExplainState *es, List *options, ParseState *pstate)
 }
 
 /*
- * Read the counters, which a reference holds counting.
+ * Read the counters of the sets, which references hold counting.
  */
 static void
-pmu_read(PmuCounts *now)
+pmu_read(uint32 sets, PmuCounts *now)
 {
 	int32		os_error = 0;
-	int32		status = pmu_counters_read(now, &os_error);
+	int32		status = pmu_counters_read(sets, now, &os_error);
 
 	if (status != PMU_OK)
 		pmu_report(status, os_error);
@@ -380,6 +386,7 @@ static void
 pmu_frame_pop(PmuFrame *frame, bool report)
 {
 	bool		referenced = frame->counting;
+	uint32		sets = frame->sets;
 	PmuHold    *hold = frame->hold;
 	int			guc_level = frame->guc_level;
 	int32		os_error = 0;
@@ -391,7 +398,7 @@ pmu_frame_pop(PmuFrame *frame, bool report)
 	pfree(frame);
 
 	if (referenced)
-		status = pmu_counters_release(&os_error);
+		status = pmu_counters_release(sets, &os_error);
 	if (!report)
 		return;
 	if (hold != NULL)
@@ -445,18 +452,18 @@ pmu_planner(Query *parse, const char *query_string, int cursorOptions,
 	if (es != NULL)
 	{
 		state = GetExplainExtensionState(es, pmu_extension_id);
-		if (state != NULL && (!state->pmu || state->frame == NULL))
+		if (state != NULL && (state->sets == 0 || state->frame == NULL))
 			state = NULL;
 	}
 	if (state != NULL)
-		pmu_read(&start);
+		pmu_read(state->frame->sets, &start);
 
 	PMU_DEEPER(result = (prev_planner ? prev_planner : standard_planner)
 			   (parse, query_string, cursorOptions, boundParams, es));
 
 	if (state != NULL)
 	{
-		pmu_read(&state->plan_end);
+		pmu_read(state->frame->sets, &state->plan_end);
 		state->plan_start = start;
 		state->planned = result;
 	}
@@ -481,9 +488,10 @@ pmu_ExecutorStart(QueryDesc *queryDesc, int eflags)
 
 		record->query = queryDesc;
 		record->plan = queryDesc->plannedstmt;
+		record->sets = frame->sets;
 		record->hold = frame->hold;
 		pmu_hold_read(record->hold, &record->cell_start);
-		pmu_read(&record->start);
+		pmu_read(record->sets, &record->start);
 		record->next = frame->records;
 		frame->records = record;
 	}
@@ -514,7 +522,7 @@ pmu_ExecutorFinish(QueryDesc *queryDesc)
 	record = pmu_find_record(queryDesc);
 	if (record != NULL && !record->finished)
 	{
-		pmu_read(&record->finish);
+		pmu_read(record->sets, &record->finish);
 		pmu_hold_read(record->hold, &record->cell_finish);
 		record->finished = true;
 
@@ -558,30 +566,63 @@ pmu_ExecutorEnd(QueryDesc *queryDesc)
 		standard_ExecutorEnd(queryDesc);
 }
 
+/* One count printed under its name in the formats other than text. */
+static void
+pmu_property(ExplainState *es, const char *phase, const char *name,
+			 uint64 value)
+{
+	char		label[64];
+
+	snprintf(label, sizeof(label), "%s %s", phase, name);
+	ExplainPropertyUInteger(label, NULL, value, es);
+}
+
 /*
- * Print two counts: in text one line, in the other formats integer
- * properties named "<phase> Instructions" and "<phase> Cycles".
+ * Print the counts of the sets: in text one line, in the other formats
+ * integer properties named "<phase> Instructions", "<phase> Cycles" and
+ * so on for each set.
  */
 static void
-pmu_print(ExplainState *es, const char *phase, uint64 instructions,
-		  uint64 cycles)
+pmu_print(ExplainState *es, const char *phase, const PmuCounts *counts,
+		  uint32 sets)
 {
+	bool		branches = (sets & PMU_EVENTS_BRANCHES) != 0;
+	bool		cache = (sets & PMU_EVENTS_CACHE) != 0;
+
 	if (es->format == EXPLAIN_FORMAT_TEXT)
 	{
 		ExplainIndentText(es);
 		appendStringInfo(es->str,
 						 "%s PMU: instructions=" UINT64_FORMAT
-						 " cycles=" UINT64_FORMAT "\n",
-						 phase, instructions, cycles);
+						 " cycles=" UINT64_FORMAT,
+						 phase, counts->instructions, counts->cycles);
+		if (branches)
+			appendStringInfo(es->str,
+							 " branches=" UINT64_FORMAT
+							 " branch-misses=" UINT64_FORMAT,
+							 counts->branches, counts->branch_misses);
+		if (cache)
+			appendStringInfo(es->str,
+							 " cache-references=" UINT64_FORMAT
+							 " cache-misses=" UINT64_FORMAT,
+							 counts->cache_references, counts->cache_misses);
+		appendStringInfoChar(es->str, '\n');
 	}
 	else
 	{
-		char		label[64];
-
-		snprintf(label, sizeof(label), "%s Instructions", phase);
-		ExplainPropertyUInteger(label, NULL, instructions, es);
-		snprintf(label, sizeof(label), "%s Cycles", phase);
-		ExplainPropertyUInteger(label, NULL, cycles, es);
+		pmu_property(es, phase, "Instructions", counts->instructions);
+		pmu_property(es, phase, "Cycles", counts->cycles);
+		if (branches)
+		{
+			pmu_property(es, phase, "Branches", counts->branches);
+			pmu_property(es, phase, "Branch Misses", counts->branch_misses);
+		}
+		if (cache)
+		{
+			pmu_property(es, phase, "Cache References",
+						 counts->cache_references);
+			pmu_property(es, phase, "Cache Misses", counts->cache_misses);
+		}
 	}
 }
 
@@ -601,15 +642,16 @@ pmu_explain_per_plan(PlannedStmt *plannedstmt, IntoClause *into,
 {
 	PmuExplainState *state;
 	PmuRecord  *record = NULL;
-	uint64		workers_instructions;
-	uint64		workers_cycles;
+	PmuCounts	planning;
+	PmuCounts	workers;
+	PmuCounts	execution;
 
 	if (prev_explain_per_plan_hook)
 		prev_explain_per_plan_hook(plannedstmt, into, es, queryString,
 								   params, queryEnv);
 
 	state = GetExplainExtensionState(es, pmu_extension_id);
-	if (state == NULL || !state->pmu)
+	if (state == NULL || state->sets == 0)
 		return;
 
 	if (state->frame != NULL)
@@ -625,60 +667,73 @@ pmu_explain_per_plan(PlannedStmt *plannedstmt, IntoClause *into,
 				 errmsg("pg_pmu found no counts of the plan it prints")));
 
 	if (state->planned == plannedstmt)
-		pmu_print(es, "Planning",
-				  state->plan_end.instructions - state->plan_start.instructions,
-				  state->plan_end.cycles - state->plan_start.cycles);
+	{
+		planning = pmu_counts_minus(&state->plan_end, &state->plan_start);
+		pmu_print(es, "Planning", &planning, record->sets);
+	}
 	state->planned = NULL;
 
 	/* The counts of the execution include the part of the workers. */
-	workers_instructions = record->cell_finish.instructions -
-		record->cell_start.instructions;
-	workers_cycles = record->cell_finish.cycles - record->cell_start.cycles;
-	pmu_print(es, "Execution",
-			  record->finish.instructions - record->start.instructions +
-			  workers_instructions,
-			  record->finish.cycles - record->start.cycles + workers_cycles);
-	if (es->verbose && workers_instructions > 0)
-		pmu_print(es, "Workers", workers_instructions, workers_cycles);
+	workers = pmu_counts_minus(&record->cell_finish.counts,
+							   &record->cell_start.counts);
+	execution = pmu_counts_minus(&record->finish, &record->start);
+	pmu_counts_add(&execution, &workers);
+	pmu_print(es, "Execution", &execution, record->sets);
+	if (es->verbose && workers.instructions > 0)
+		pmu_print(es, "Workers", &workers, record->sets);
 	pmu_free_records(state->frame);
 }
 
+/* The error of the system, where the crate gave one. */
+#define PMU_SYSTEM_DETAIL() \
+	(os_error != 0 ? errdetail("The system said: %m.") : 0)
+
 /*
- * Open the counters of this process, once. The crate says how many file
- * descriptors it needs; they come from PostgreSQL's budget of external
- * files, and go back to it when the opening fails. The crate owns the
- * descriptors themselves and closes them on a failure.
+ * Open the counters of the sets of this process that are not open yet,
+ * the basic one first; each stays open until the process exits. The
+ * crate says how many file descriptors a set needs; they come from
+ * PostgreSQL's budget of external files, and go back to it when its
+ * opening fails. The crate owns the descriptors themselves and closes
+ * them on a failure.
  */
 void
-pmu_open_counters(void)
+pmu_open_counters(uint32 sets)
 {
-	uint32		descriptors = 0;
-	int32		os_error = 0;
-	int32		status;
+	static const uint32 order[] = {
+		PMU_EVENTS_BASIC, PMU_EVENTS_BRANCHES, PMU_EVENTS_CACHE
+	};
 
-	if (pmu_counters_opened)
-		return;
-
-	status = pmu_counters_plan(PMU_SYSFS, &descriptors, &os_error);
-	if (status != PMU_OK)
-		pmu_report(status, os_error);
-
-	for (uint32 taken = 0; taken < descriptors; taken++)
+	for (int i = 0; i < lengthof(order); i++)
 	{
-		if (!AcquireExternalFD())
+		uint32		set = order[i];
+		uint32		descriptors = 0;
+		int32		os_error = 0;
+		int32		status;
+
+		if ((sets & set) == 0 || (pmu_sets_open & set) != 0)
+			continue;
+
+		status = pmu_counters_plan(PMU_SYSFS, set, &descriptors, &os_error);
+		if (status != PMU_OK)
+			pmu_report(status, os_error);
+
+		for (uint32 taken = 0; taken < descriptors; taken++)
 		{
-			pmu_release_descriptors(taken);
-			pmu_report(PMU_NO_DESCRIPTOR, EMFILE);
+			if (!AcquireExternalFD())
+			{
+				pmu_release_descriptors(taken);
+				pmu_report(PMU_NO_DESCRIPTOR, EMFILE);
+			}
 		}
-	}
 
-	status = pmu_counters_open(&os_error);
-	if (status != PMU_OK)
-	{
-		pmu_release_descriptors(descriptors);
-		pmu_report(status, os_error);
+		status = pmu_counters_open(set, &os_error);
+		if (status != PMU_OK)
+		{
+			pmu_release_descriptors(descriptors);
+			pmu_report(status, os_error);
+		}
+		pmu_sets_open |= set;
 	}
-	pmu_counters_opened = true;
 }
 
 static void
@@ -687,10 +742,6 @@ pmu_release_descriptors(uint32 n)
 	for (uint32 i = 0; i < n; i++)
 		ReleaseExternalFD();
 }
-
-/* The error of the system, where the crate gave one. */
-#define PMU_SYSTEM_DETAIL() \
-	(os_error != 0 ? errdetail("The system said: %m.") : 0)
 
 /*
  * The SQLSTATE of a code of the crate, as the README lists it.
@@ -708,6 +759,7 @@ pmu_status_sqlstate(int32 status)
 		case PMU_KIND_NOT_OPENABLE:
 		case PMU_TOO_MANY_KINDS:
 		case PMU_TOO_MANY_THREADS:
+		case PMU_EVENTS_NOT_COUNTED:
 			return ERRCODE_FEATURE_NOT_SUPPORTED;
 		case PMU_NO_FREE_COUNTER:
 		case PMU_NO_DESCRIPTOR:
@@ -769,6 +821,12 @@ pmu_report(int32 status, int32 os_error)
 					(errcode(pmu_status_sqlstate(status)),
 					 errmsg("this process runs more threads than pg_pmu counts on"),
 					 errdetail("It counts up to 64 threads that run when the counters open.")));
+			break;
+		case PMU_EVENTS_NOT_COUNTED:
+			ereport(ERROR,
+					(errcode(pmu_status_sqlstate(status)),
+					 errmsg("this system cannot count the branches or the cache"),
+					 PMU_SYSTEM_DETAIL()));
 			break;
 		case PMU_KIND_NOT_OPENABLE:
 			ereport(ERROR,

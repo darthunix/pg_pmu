@@ -1,30 +1,41 @@
-//! The counters of Linux: for each thread of the process and each kind
-//! of cores, one group of two perf events, instructions and cycles, on
-//! that thread and any CPU, in user space only.
+//! The counters of Linux: for each set of events, each thread of the
+//! process and each kind of cores, one group of the two perf events of
+//! the set, on that thread and any CPU, in user space only. The basic
+//! set counts instructions and cycles; the others, opened only when a
+//! statement asks for them, the branches and the cache with the
+//! kernel's generic events.
 //!
-//! The threads are those that run when the counters open, listed once.
+//! The threads of a set are those that run when it opens, listed once.
 //! Every event is inherited: a thread or a process that a counted
 //! thread starts later gets copies of its groups, and a read of a group
 //! adds the copies in, those of threads that have ended too. So the
-//! groups count the whole process, and no thread twice: listing the
-//! threads again would give those started later a second group. Linux
-//! before 4.13 refuses inheritance with reads of a group; there the
-//! events are not inherited, and threads started later are not counted.
+//! groups of a set count the whole process, and no thread twice:
+//! listing the threads again would give those started later a second
+//! group. Linux before 4.13 refuses inheritance with reads of a group;
+//! there the events are not inherited, and threads started later are
+//! not counted.
 //!
 //! Each group is pinned: the kernel keeps it on hardware counters all
 //! the time, or puts it into an error state where a read returns no
 //! bytes, so counts are never scaled from a part of the time. It is
-//! opened disabled and enabled while a reference is held; enabling it
-//! again takes it out of an error state. The calls of the system go
-//! through [`PerfSys`], so that all of this is tested on any system.
+//! opened disabled and enabled while a reference to its set is held;
+//! enabling it again takes it out of an error state. The basic set is
+//! opened first and the others when a statement first asks for them,
+//! and the kernel puts the pinned groups of a thread on the counters in
+//! the order they were made, so another set cannot take the counters of
+//! the basic one; of two others, the one opened first wins. The calls
+//! of the system go through [`PerfSys`], so that all of this is tested
+//! on any system.
 
 use core::ffi::CStr;
 
 use super::perf_abi::{
-    self, FLAG_INHERIT, PERF_COUNT_HW_CPU_CYCLES, PERF_COUNT_HW_INSTRUCTIONS,
-    PERF_EVENT_IOC_DISABLE, PERF_EVENT_IOC_ENABLE, PERF_IOC_FLAG_GROUP, PerfEventAttr,
+    self, FLAG_INHERIT, PERF_COUNT_HW_BRANCH_INSTRUCTIONS, PERF_COUNT_HW_BRANCH_MISSES,
+    PERF_COUNT_HW_CACHE_MISSES, PERF_COUNT_HW_CACHE_REFERENCES, PERF_COUNT_HW_CPU_CYCLES,
+    PERF_COUNT_HW_INSTRUCTIONS, PERF_EVENT_IOC_DISABLE, PERF_EVENT_IOC_ENABLE, PERF_IOC_FLAG_GROUP,
+    PerfEventAttr,
 };
-use super::{Backend, Counts};
+use super::{Backend, SETS, Set};
 use crate::sysfs::{self, LibcFs, MAX_KINDS, Plan};
 use crate::{Error, Status};
 
@@ -42,6 +53,24 @@ pub trait PerfSys {
     fn threads(&mut self, out: &mut [i32]) -> Result<usize, i32>;
     /// What the processor says of its kinds of cores, where it says.
     fn uniform_cores(&self) -> Option<bool>;
+    /// Refer to the cache from the calling thread, so that a group of the
+    /// cache that counts reads more than zero at the check of its
+    /// opening: [`refer_to_the_cache`].
+    fn refer_to_the_cache(&mut self) {
+        refer_to_the_cache();
+    }
+}
+
+/// The two events of a set: the leader of each group and its member.
+pub const fn events_of(set: Set) -> (u64, u64) {
+    match set {
+        Set::Basic => (PERF_COUNT_HW_INSTRUCTIONS, PERF_COUNT_HW_CPU_CYCLES),
+        Set::Branches => (
+            PERF_COUNT_HW_BRANCH_INSTRUCTIONS,
+            PERF_COUNT_HW_BRANCH_MISSES,
+        ),
+        Set::Cache => (PERF_COUNT_HW_CACHE_REFERENCES, PERF_COUNT_HW_CACHE_MISSES),
+    }
 }
 
 /// The two events of a group, each a file descriptor; -1 when closed.
@@ -59,10 +88,26 @@ const CLOSED: Group = Group {
 /// Bytes of a read of a group: the number of events, then their values.
 const READ_LEN: usize = 8 * 3;
 
-/// The threads that may run when the counters open. A process of
-/// PostgreSQL has one; more than this are refused rather than counted
-/// in part.
+/// The threads that may run when the counters of a set open. A process
+/// of PostgreSQL has one; more than this are refused rather than
+/// counted in part.
 pub const MAX_THREADS: usize = 64;
+
+/// The groups of one set: the threads listed when it was planned, of
+/// which the first `nthreads`, and their groups, one for each kind of
+/// cores; closed for a thread that ended before the opening.
+#[derive(Clone, Copy)]
+struct Groups {
+    threads: [i32; MAX_THREADS],
+    nthreads: usize,
+    groups: [[Group; MAX_KINDS]; MAX_THREADS],
+}
+
+const NO_GROUPS: Groups = Groups {
+    threads: [0; MAX_THREADS],
+    nthreads: 0,
+    groups: [[CLOSED; MAX_KINDS]; MAX_THREADS],
+};
 
 /// The id of a thread from the name of its directory in
 /// `/proc/self/task`: decimal digits, from 1 to `i32::MAX`. `None` for
@@ -100,8 +145,8 @@ pub fn parse_group_read(buf: &[u8]) -> Option<(u64, u64)> {
     Some((word(1)?, word(2)?))
 }
 
-/// What an error of `perf_event_open` means. `typed` is whether the
-/// event named a kind of cores.
+/// What an error of `perf_event_open` means for an event of the basic
+/// set. `typed` is whether the event named a kind of cores.
 pub fn open_error(errno: i32, typed: bool) -> Error {
     let status = match errno {
         libc::EACCES | libc::EPERM => Status::NotPermitted,
@@ -118,15 +163,28 @@ pub fn open_error(errno: i32, typed: bool) -> Error {
     Error::os(status, errno)
 }
 
+/// What an error of `perf_event_open` means for an event of `set`. The
+/// events of the other sets open only after the basic ones, with the
+/// same attributes but the event, so the kernel takes the process, the
+/// kinds of cores and the attributes: an event the processor or the
+/// kernel lacks is what is left for ENOENT, EOPNOTSUPP, ENODEV and
+/// EINVAL, which the kernel gives for one it does not map.
+pub fn open_error_of(set: Set, errno: i32, typed: bool) -> Error {
+    match (set, errno) {
+        (Set::Basic, _) => open_error(errno, typed),
+        (_, libc::ENOENT | libc::EOPNOTSUPP | libc::ENODEV | libc::EINVAL) => {
+            Error::os(Status::EventsNotCounted, errno)
+        }
+        _ => open_error(errno, typed),
+    }
+}
+
 pub struct Perf<S> {
     sys: S,
+    /// The kinds of cores, planned with the basic set.
     plan: Option<Plan>,
-    /// The threads the plan listed, of which the first `nthreads`.
-    threads: [i32; MAX_THREADS],
-    nthreads: usize,
-    /// The groups of each thread, one for each kind of cores; closed for
-    /// a thread that ended before the opening.
-    groups: [[Group; MAX_KINDS]; MAX_THREADS],
+    /// The groups of each set, in the order of [`Set::ALL`].
+    sets: [Groups; SETS],
     /// Whether the events are inherited: false once the kernel refused.
     inherit: bool,
 }
@@ -136,9 +194,7 @@ impl<S: PerfSys> Perf<S> {
         Perf {
             sys,
             plan: None,
-            threads: [0; MAX_THREADS],
-            nthreads: 0,
-            groups: [[CLOSED; MAX_KINDS]; MAX_THREADS],
+            sets: [NO_GROUPS; SETS],
             inherit: true,
         }
     }
@@ -159,9 +215,28 @@ impl<S: PerfSys> Perf<S> {
     }
 
     /// Take a plan of the kinds of cores made elsewhere, as the tests do,
-    /// and list the threads; return the number of descriptors the
-    /// opening needs at most: a thread that ends before it uses none.
+    /// and plan the basic set; return the number of descriptors.
     pub fn set_plan(&mut self, plan: Plan) -> Result<u32, Error> {
+        let n = self.list(Set::Basic)?;
+        self.plan = Some(plan);
+        Ok(descriptors(&plan, n))
+    }
+
+    /// Plan a set other than the basic one, on the kinds of cores of the
+    /// basic one; return the number of descriptors.
+    pub fn plan_set(&mut self, set: Set) -> Result<u32, Error> {
+        let plan = self.plan.ok_or(Error::new(Status::Internal))?;
+        if set == Set::Basic {
+            return self.set_plan(plan);
+        }
+        let n = self.list(set)?;
+        Ok(descriptors(&plan, n))
+    }
+
+    /// List the threads for a set; return how many. The opening needs
+    /// descriptors for that many at most: a thread that ends before it
+    /// uses none.
+    fn list(&mut self, set: Set) -> Result<usize, Error> {
         let mut threads = [0; MAX_THREADS];
         let n = self.sys.threads(&mut threads).map_err(|e| match e {
             libc::EMFILE | libc::ENFILE => Error::os(Status::NoDescriptor, e),
@@ -174,20 +249,49 @@ impl<S: PerfSys> Perf<S> {
         if n == 0 {
             return Err(Error::new(Status::SystemError));
         }
-        self.threads = threads;
-        self.nthreads = n;
-        self.plan = Some(plan);
-        Ok(descriptors(&plan, n))
+        let groups = self.groups_mut(set)?;
+        groups.threads = threads;
+        groups.nthreads = n;
+        Ok(n)
+    }
+
+    fn groups(&self, set: Set) -> Option<&Groups> {
+        self.sets.get(set.index())
+    }
+
+    fn groups_mut(&mut self, set: Set) -> Result<&mut Groups, Error> {
+        self.sets
+            .get_mut(set.index())
+            .ok_or(Error::new(Status::Internal))
+    }
+
+    fn nthreads(&self, set: Set) -> usize {
+        self.groups(set).map_or(0, |g| g.nthreads.min(MAX_THREADS))
     }
 
     fn count(&self) -> usize {
         self.plan.map_or(0, |p| p.count.min(MAX_KINDS))
     }
 
+    /// The open groups of a set.
+    fn open_groups(&self, set: Set) -> impl Iterator<Item = Group> + '_ {
+        let kinds = self.count();
+        self.groups(set)
+            .into_iter()
+            .flat_map(move |g| {
+                g.groups
+                    .iter()
+                    .take(g.nthreads.min(MAX_THREADS))
+                    .flat_map(move |row| row.iter().take(kinds))
+            })
+            .copied()
+            .filter(|g| g.leader >= 0)
+    }
+
     /// Open an event on the thread `tid`, inherited unless the kernel
     /// refused. A kernel that refuses inheritance with reads of a group
-    /// says EINVAL to the first leader; another EINVAL without it is an
-    /// error of its own. The error is `errno`.
+    /// says EINVAL to the first leader of the process; another EINVAL
+    /// without it is an error of its own. The error is `errno`.
     fn open_event(
         &mut self,
         event: u64,
@@ -200,10 +304,12 @@ impl<S: PerfSys> Perf<S> {
         if !self.inherit {
             attr.flags &= !FLAG_INHERIT;
         }
+        let first = leader
+            && Set::ALL
+                .iter()
+                .all(|&s| self.open_groups(s).next().is_none());
         match self.sys.open(&attr, tid, group_fd) {
-            Err(libc::EINVAL)
-                if self.inherit && leader && self.groups.iter().flatten().all(|g| g.leader < 0) =>
-            {
+            Err(libc::EINVAL) if self.inherit && first => {
                 attr.flags &= !FLAG_INHERIT;
                 let fd = self.sys.open(&attr, tid, group_fd)?;
                 self.inherit = false;
@@ -213,10 +319,11 @@ impl<S: PerfSys> Perf<S> {
         }
     }
 
-    /// Open a group on the thread `tid`; the error is `errno`.
-    fn open_group(&mut self, unit: Option<u32>, tid: i32) -> Result<Group, i32> {
-        let leader = self.open_event(PERF_COUNT_HW_INSTRUCTIONS, unit, tid, -1)?;
-        match self.open_event(PERF_COUNT_HW_CPU_CYCLES, unit, tid, leader) {
+    /// Open a group of a set on the thread `tid`; the error is `errno`.
+    fn open_group(&mut self, set: Set, unit: Option<u32>, tid: i32) -> Result<Group, i32> {
+        let (first, second) = events_of(set);
+        let leader = self.open_event(first, unit, tid, -1)?;
+        match self.open_event(second, unit, tid, leader) {
             Ok(member) => Ok(Group { leader, member }),
             Err(e) => {
                 self.sys.close(leader);
@@ -225,36 +332,41 @@ impl<S: PerfSys> Perf<S> {
         }
     }
 
-    /// Close the groups of the thread at `index` in the list.
-    fn close_thread(&mut self, index: usize) {
-        if let Some(row) = self.groups.get_mut(index) {
-            for g in row.iter_mut() {
-                if g.member >= 0 {
-                    self.sys.close(g.member);
-                }
-                if g.leader >= 0 {
-                    self.sys.close(g.leader);
-                }
-                *g = CLOSED;
+    /// Close the groups of the thread at `index` in the list of a set.
+    fn close_thread(&mut self, set: Set, index: usize) {
+        let Some(row) = self
+            .sets
+            .get_mut(set.index())
+            .and_then(|g| g.groups.get_mut(index))
+        else {
+            return;
+        };
+        for g in row.iter_mut() {
+            if g.member >= 0 {
+                self.sys.close(g.member);
             }
+            if g.leader >= 0 {
+                self.sys.close(g.leader);
+            }
+            *g = CLOSED;
         }
     }
 
-    fn close_all(&mut self) {
+    fn close_set(&mut self, set: Set) {
         for index in 0..MAX_THREADS {
-            self.close_thread(index);
+            self.close_thread(set, index);
         }
     }
 
-    /// Open the groups of the thread at `index` in the list, one for
-    /// each kind. A thread that ended after the listing has nothing left
-    /// to count, and keeps no group. Its id could in theory go to a new
-    /// thread of another process of the user in between; that needs the
-    /// ids to wrap around within the opening.
-    fn open_thread(&mut self, plan: &Plan, index: usize) -> Result<(), Error> {
+    /// Open the groups of a set on the thread at `index` in its list,
+    /// one for each kind. A thread that ended after the listing has
+    /// nothing left to count, and keeps no group. Its id could in theory
+    /// go to a new thread of another process of the user in between;
+    /// that needs the ids to wrap around within the opening.
+    fn open_thread(&mut self, set: Set, plan: &Plan, index: usize) -> Result<(), Error> {
         let tid = self
-            .threads
-            .get(index)
+            .groups(set)
+            .and_then(|g| g.threads.get(index))
             .copied()
             .ok_or(Error::new(Status::Internal))?;
         for kind in 0..self.count() {
@@ -263,15 +375,20 @@ impl<S: PerfSys> Perf<S> {
             } else {
                 None
             };
-            let g = match self.open_group(unit, tid) {
+            let g = match self.open_group(set, unit, tid) {
                 Ok(g) => g,
                 Err(libc::ESRCH) => {
-                    self.close_thread(index);
+                    self.close_thread(set, index);
                     return Ok(());
                 }
-                Err(e) => return Err(open_error(e, unit.is_some())),
+                Err(e) => return Err(open_error_of(set, e, unit.is_some())),
             };
-            match self.groups.get_mut(index).and_then(|row| row.get_mut(kind)) {
+            match self
+                .sets
+                .get_mut(set.index())
+                .and_then(|groups| groups.groups.get_mut(index))
+                .and_then(|row| row.get_mut(kind))
+            {
                 Some(slot) => *slot = g,
                 None => {
                     self.sys.close(g.member);
@@ -283,45 +400,69 @@ impl<S: PerfSys> Perf<S> {
         Ok(())
     }
 
-    fn each_leader(&mut self, request: u64) -> Result<(), Error> {
-        let kinds = self.count();
-        for row in self.groups.iter().take(self.nthreads) {
-            for g in row.iter().take(kinds).filter(|g| g.leader >= 0) {
-                self.sys
-                    .ioctl(g.leader, request, PERF_IOC_FLAG_GROUP)
-                    .map_err(|e| Error::os(Status::SystemError, e))?;
-            }
+    fn each_leader(&mut self, set: Set, request: u64) -> Result<(), Error> {
+        let mut leaders = [-1; MAX_THREADS * MAX_KINDS];
+        for (slot, g) in leaders.iter_mut().zip(self.open_groups(set)) {
+            *slot = g.leader;
+        }
+        for &fd in leaders.iter().filter(|&&fd| fd >= 0) {
+            self.sys
+                .ioctl(fd, request, PERF_IOC_FLAG_GROUP)
+                .map_err(|e| Error::os(Status::SystemError, e))?;
         }
         Ok(())
     }
 
-    /// Read and add the groups; `lost` is the code of a group in the
-    /// error state.
-    fn read_groups(&mut self, lost: Status) -> Result<Counts, Error> {
-        let mut total = Counts::default();
-        let kinds = self.count();
-        for g in self
-            .groups
-            .iter()
-            .take(self.nthreads)
-            .flat_map(|row| row.iter().take(kinds))
-            .filter(|g| g.leader >= 0)
-        {
+    /// Read and add the groups of a set; `lost` is the code of a group
+    /// in the error state.
+    fn read_groups(&mut self, set: Set, lost: Status) -> Result<(u64, u64), Error> {
+        let mut leaders = [-1; MAX_THREADS * MAX_KINDS];
+        for (slot, g) in leaders.iter_mut().zip(self.open_groups(set)) {
+            *slot = g.leader;
+        }
+        let (mut first, mut second) = (0u64, 0u64);
+        for &fd in leaders.iter().filter(|&&fd| fd >= 0) {
             let mut buf = [0u8; READ_LEN + 8];
             let n = self
                 .sys
-                .read(g.leader, &mut buf)
+                .read(fd, &mut buf)
                 .map_err(|e| Error::os(Status::SystemError, e))?;
             // No bytes: the pinned group is in the error state. Any other
             // length, or another number of events, is never reused.
-            let (instructions, cycles) = buf
+            let (a, b) = buf
                 .get(..n)
                 .and_then(parse_group_read)
                 .ok_or(Error::new(lost))?;
-            total.instructions = total.instructions.wrapping_add(instructions);
-            total.cycles = total.cycles.wrapping_add(cycles);
+            first = first.wrapping_add(a);
+            second = second.wrapping_add(b);
         }
-        Ok(total)
+        Ok((first, second))
+    }
+}
+
+/// Whether [`refer_to_the_cache`] flushes the lines it loads, so that
+/// each load misses the cache as well.
+pub const FLUSHES: bool = cfg!(target_arch = "x86_64");
+
+/// Refer to the cache the generic event of references counts: the last
+/// level on Intel, the second on AMD, the first on Arm. On x86-64 a line
+/// of the stack is flushed from every level and loaded again, a few
+/// times, so that each load misses the levels below; on Arm every load
+/// is a reference to the first level. A hypervisor that hides the
+/// events of the cache, as some of the cloud do, leaves the group at
+/// zero, which the check of the opening refuses rather than print zeros.
+fn refer_to_the_cache() {
+    let line = [0u8; 64];
+    for _ in 0..8 {
+        #[cfg(target_arch = "x86_64")]
+        // SAFETY: clflush and mfence are in every x86-64 processor (SSE2)
+        // and run in user space; the address is that of a live local.
+        unsafe {
+            core::arch::x86_64::_mm_clflush(line.as_ptr());
+            core::arch::x86_64::_mm_mfence();
+        }
+        // SAFETY: the address is that of a live local, aligned for u8.
+        let _ = unsafe { core::ptr::read_volatile(line.as_ptr()) };
     }
 }
 
@@ -333,7 +474,10 @@ fn descriptors(plan: &Plan, threads: usize) -> u32 {
 }
 
 impl<S: PerfSys> Backend for Perf<S> {
-    fn plan(&mut self, sysfs: &CStr) -> Result<u32, Error> {
+    fn plan(&mut self, sysfs: &CStr, set: Set) -> Result<u32, Error> {
+        if set != Set::Basic {
+            return self.plan_set(set);
+        }
         let fs = LibcFs {
             root: sysfs.to_bytes(),
         };
@@ -341,49 +485,59 @@ impl<S: PerfSys> Backend for Perf<S> {
         self.set_plan(plan)
     }
 
-    fn open(&mut self) -> Result<(), Error> {
+    fn open(&mut self, set: Set) -> Result<(), Error> {
         let plan = self.plan.ok_or(Error::new(Status::Internal))?;
-        for index in 0..self.nthreads {
-            if let Err(e) = self.open_thread(&plan, index) {
-                self.close_all();
+        for index in 0..self.nthreads(set) {
+            if let Err(e) = self.open_thread(set, &plan, index) {
+                self.close_set(set);
                 return Err(e);
             }
         }
         // Check that the groups count: a group that finds no free
         // counter is in the error state and reads no bytes, and a group
-        // that the hypervisor opens but never counts reads zero.
+        // that the hypervisor opens but never counts reads zero. The
+        // calling thread runs instructions and branches between the
+        // enabling and the read, and refers to the cache in between.
         let check = self
-            .each_leader(PERF_EVENT_IOC_ENABLE)
-            .and_then(|()| self.read_groups(Status::NoFreeCounter))
-            .and_then(|counts| {
-                if counts.instructions == 0 {
-                    Err(Error::new(Status::NoCounters))
-                } else {
-                    Ok(())
+            .each_leader(set, PERF_EVENT_IOC_ENABLE)
+            .and_then(|()| {
+                if set == Set::Cache {
+                    self.sys.refer_to_the_cache();
                 }
+                self.read_groups(set, Status::NoFreeCounter)
             })
-            .and_then(|()| self.each_leader(PERF_EVENT_IOC_DISABLE));
+            .and_then(|(first, second)| match set {
+                Set::Basic if first == 0 => Err(Error::new(Status::NoCounters)),
+                Set::Branches | Set::Cache if first == 0 => {
+                    Err(Error::new(Status::EventsNotCounted))
+                }
+                // The flushed lines missed the cache too.
+                Set::Cache if FLUSHES && second == 0 => Err(Error::new(Status::EventsNotCounted)),
+                _ => Ok(()),
+            })
+            .and_then(|()| self.each_leader(set, PERF_EVENT_IOC_DISABLE));
         if let Err(e) = check {
-            let _ = self.each_leader(PERF_EVENT_IOC_DISABLE);
-            self.close_all();
+            let _ = self.each_leader(set, PERF_EVENT_IOC_DISABLE);
+            self.close_set(set);
             return Err(e);
         }
         Ok(())
     }
 
-    fn enable(&mut self) -> Result<(), Error> {
-        // A failure midway leaves no group on.
-        self.each_leader(PERF_EVENT_IOC_ENABLE).inspect_err(|_| {
-            let _ = self.each_leader(PERF_EVENT_IOC_DISABLE);
-        })
+    fn enable(&mut self, set: Set) -> Result<(), Error> {
+        // A failure midway leaves no group of the set on.
+        self.each_leader(set, PERF_EVENT_IOC_ENABLE)
+            .inspect_err(|_| {
+                let _ = self.each_leader(set, PERF_EVENT_IOC_DISABLE);
+            })
     }
 
-    fn disable(&mut self) -> Result<(), Error> {
-        self.each_leader(PERF_EVENT_IOC_DISABLE)
+    fn disable(&mut self, set: Set) -> Result<(), Error> {
+        self.each_leader(set, PERF_EVENT_IOC_DISABLE)
     }
 
-    fn read(&mut self) -> Result<Counts, Error> {
-        self.read_groups(Status::CounterLost)
+    fn read(&mut self, set: Set) -> Result<(u64, u64), Error> {
+        self.read_groups(set, Status::CounterLost)
     }
 }
 

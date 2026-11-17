@@ -15,12 +15,14 @@ use std::collections::{BTreeSet, HashMap};
 
 use proptest::prelude::*;
 
-use pmu_counters::counters::perf::{MAX_THREADS, Perf, PerfSys, open_error, parse_tid};
-use pmu_counters::counters::perf_abi::{
-    FLAG_INHERIT, LEADER_FLAGS, MEMBER_FLAGS, PERF_EVENT_IOC_DISABLE, PERF_EVENT_IOC_ENABLE,
-    PerfEventAttr,
+use pmu_counters::counters::perf::{
+    FLUSHES, MAX_THREADS, Perf, PerfSys, events_of, open_error, open_error_of, parse_tid,
 };
-use pmu_counters::counters::{Backend, Counters, Counts};
+use pmu_counters::counters::perf_abi::{
+    FLAG_INHERIT, LEADER_FLAGS, MEMBER_FLAGS, PERF_COUNT_HW_CACHE_REFERENCES,
+    PERF_EVENT_IOC_DISABLE, PERF_EVENT_IOC_ENABLE, PerfEventAttr,
+};
+use pmu_counters::counters::{ALL_SETS, Backend, Counters, Counts, SETS, Set, sets_in};
 use pmu_counters::sysfs::{self, Fs, MAX_KINDS, Malformed, Plan};
 use pmu_counters::{Error, Status};
 
@@ -277,17 +279,19 @@ proptest! {
 // The references
 // ---------------------------------------------------------------------
 
-/// A backend that fails a call when told, and counts while enabled.
+/// A backend that fails the next call of a set when told, and counts
+/// each set while it is enabled.
 #[derive(Default)]
 struct Fake {
-    enabled: bool,
-    value: u64,
-    fail_next: bool,
+    enabled: [bool; SETS],
+    value: [u64; SETS],
+    fail_next: Option<Set>,
 }
 
 impl Fake {
-    fn fail(&mut self) -> Result<(), Error> {
-        if std::mem::take(&mut self.fail_next) {
+    fn fail(&mut self, set: Set) -> Result<(), Error> {
+        if self.fail_next == Some(set) {
+            self.fail_next = None;
             Err(Error::new(Status::CounterLost))
         } else {
             Ok(())
@@ -296,45 +300,45 @@ impl Fake {
 }
 
 impl Backend for Fake {
-    fn plan(&mut self, _: &std::ffi::CStr) -> Result<u32, Error> {
+    fn plan(&mut self, _: &std::ffi::CStr, _: Set) -> Result<u32, Error> {
         Ok(0)
     }
-    fn open(&mut self) -> Result<(), Error> {
+    fn open(&mut self, _: Set) -> Result<(), Error> {
         Ok(())
     }
-    fn enable(&mut self) -> Result<(), Error> {
-        self.fail()?;
-        self.enabled = true;
+    fn enable(&mut self, set: Set) -> Result<(), Error> {
+        self.fail(set)?;
+        self.enabled[set.index()] = true;
         Ok(())
     }
-    fn disable(&mut self) -> Result<(), Error> {
-        self.enabled = false;
+    fn disable(&mut self, set: Set) -> Result<(), Error> {
+        self.enabled[set.index()] = false;
         Ok(())
     }
-    fn read(&mut self) -> Result<Counts, Error> {
-        self.fail()?;
-        if self.enabled {
-            self.value += 1;
+    fn read(&mut self, set: Set) -> Result<(u64, u64), Error> {
+        self.fail(set)?;
+        let i = set.index();
+        if self.enabled[i] {
+            self.value[i] += 1;
         }
-        Ok(Counts {
-            instructions: self.value,
-            cycles: self.value,
-        })
+        Ok((self.value[i], self.value[i]))
     }
 }
 
 #[derive(Clone, Copy, Debug)]
 enum Op {
-    Acquire { fail: bool },
-    Read { fail: bool },
-    Release,
+    Acquire { sets: u32, fail: Option<Set> },
+    Read { sets: u32, fail: Option<Set> },
+    Release { sets: u32 },
 }
 
 fn op() -> impl Strategy<Value = Op> {
+    let sets = 0..=ALL_SETS;
+    let fail = prop::option::weighted(0.15, prop::sample::select(&Set::ALL[..]));
     prop_oneof![
-        prop::bool::weighted(0.1).prop_map(|fail| Op::Acquire { fail }),
-        prop::bool::weighted(0.1).prop_map(|fail| Op::Read { fail }),
-        Just(Op::Release),
+        (sets.clone(), fail.clone()).prop_map(|(sets, fail)| Op::Acquire { sets, fail }),
+        (sets.clone(), fail).prop_map(|(sets, fail)| Op::Read { sets, fail }),
+        sets.prop_map(|sets| Op::Release { sets }),
     ]
 }
 
@@ -342,58 +346,69 @@ proptest! {
     #[test]
     fn references_follow_the_model(ops in prop::collection::vec(op(), 0..64)) {
         let mut c = Counters::new(Fake::default());
-        c.open().unwrap();
-        let mut refs = 0u32;
-        // The fake counts one at each read while it is enabled.
-        let mut value = 0u64;
+        for set in Set::ALL {
+            c.open(set).unwrap();
+        }
+        let mut refs = [0u32; SETS];
+        // What each set read last: readings only grow.
+        let mut last = [0u64; SETS];
         for op in ops {
             match op {
-                Op::Acquire { fail } => {
-                    c_fail(&mut c, fail);
-                    let r = c.acquire();
-                    prop_assert_eq!(r.is_ok(), !fail);
+                Op::Acquire { sets, fail } => {
+                    c.backend_mut().fail_next = fail;
+                    let r = c.acquire(sets);
+                    // All or nothing: a failing set fails the whole mask.
+                    let failed = fail.is_some_and(|f| sets & f.bit() != 0);
+                    prop_assert_eq!(r.is_ok(), !failed);
                     if let Ok(counts) = r {
-                        refs += 1;
-                        value += 1;
-                        prop_assert_eq!(counts.instructions, value);
-                    }
-                }
-                Op::Read { fail } => {
-                    c_fail(&mut c, fail);
-                    let r = c.read();
-                    if refs == 0 {
-                        prop_assert_eq!(r.unwrap_err().status, Status::Internal);
-                        clear_fail(&mut c);
-                    } else {
-                        prop_assert_eq!(r.is_ok(), !fail);
-                        if let Ok(counts) = r {
-                            value += 1;
-                            prop_assert_eq!(counts.instructions, value);
+                        for set in Set::ALL {
+                            let (a, _) = counts.pair(set);
+                            if sets & set.bit() != 0 {
+                                refs[set.index()] += 1;
+                                prop_assert!(a >= last[set.index()]);
+                                last[set.index()] = a;
+                            } else {
+                                prop_assert_eq!(a, 0);
+                            }
                         }
                     }
                 }
-                Op::Release => {
-                    let r = c.release();
-                    if refs == 0 {
+                Op::Read { sets, fail } => {
+                    c.backend_mut().fail_next = fail;
+                    let r = c.read(sets);
+                    // The first set of the mask without a reference, or
+                    // the failing one, in the order of the sets.
+                    let want = sets_in(sets).unwrap().find_map(|set| {
+                        if refs[set.index()] == 0 {
+                            Some(Status::Internal)
+                        } else if fail == Some(set) {
+                            Some(Status::CounterLost)
+                        } else {
+                            None
+                        }
+                    });
+                    prop_assert_eq!(r.err().map(|e| e.status), want);
+                }
+                Op::Release { sets } => {
+                    let r = c.release(sets);
+                    let unheld = sets_in(sets).unwrap().any(|s| refs[s.index()] == 0);
+                    if unheld {
                         prop_assert_eq!(r.unwrap_err().status, Status::Internal);
                     } else {
                         prop_assert!(r.is_ok());
-                        refs -= 1;
+                        for set in sets_in(sets).unwrap() {
+                            refs[set.index()] -= 1;
+                        }
                     }
                 }
             }
-            prop_assert_eq!(c.refs(), refs);
-            prop_assert_eq!(c.backend().enabled, refs > 0);
+            c.backend_mut().fail_next = None;
+            for set in Set::ALL {
+                prop_assert_eq!(c.refs(set), refs[set.index()]);
+                prop_assert_eq!(c.backend().enabled[set.index()], refs[set.index()] > 0);
+            }
         }
     }
-}
-
-fn c_fail(c: &mut Counters<Fake>, fail: bool) {
-    c.backend_mut().fail_next = fail;
-}
-
-fn clear_fail(c: &mut Counters<Fake>) {
-    c.backend_mut().fail_next = false;
 }
 
 // ---------------------------------------------------------------------
@@ -430,6 +445,14 @@ struct FakeSys {
     instructions: Option<u64>,
     /// Fail an enable of this leader.
     fail_enable_of: Option<i32>,
+    /// The attributes of each descriptor.
+    attr_of: HashMap<i32, PerfEventAttr>,
+    /// Leaders of the cache read zero until the thread refers to it.
+    cache_needs_a_reference: bool,
+    /// The times the thread referred to the cache.
+    references: usize,
+    /// What reads of the second event give, or 2000 + the descriptor.
+    second: Option<u64>,
 }
 
 impl PerfSys for FakeSys {
@@ -455,6 +478,7 @@ impl PerfSys for FakeSys {
         let fd = self.next_fd + 100;
         self.open.insert(fd);
         self.tid_of.insert(fd, tid);
+        self.attr_of.insert(fd, *attr);
         if group_fd == -1 {
             self.leaders.insert(fd);
         }
@@ -484,8 +508,15 @@ impl PerfSys for FakeSys {
         if self.error_state && self.enabled.contains(&fd) {
             return Ok(0);
         }
-        let instructions = self.instructions.unwrap_or(1000 + fd as u64);
-        let words = [2u64, instructions, 2000 + fd as u64];
+        let mut instructions = self.instructions.unwrap_or(1000 + fd as u64);
+        let event = self.attr_of[&fd].config & 0xffff_ffff;
+        if self.cache_needs_a_reference
+            && event == PERF_COUNT_HW_CACHE_REFERENCES
+            && self.references == 0
+        {
+            instructions = 0;
+        }
+        let words = [2u64, instructions, self.second.unwrap_or(2000 + fd as u64)];
         for (i, w) in words.iter().enumerate() {
             buf[i * 8..i * 8 + 8].copy_from_slice(&w.to_ne_bytes());
         }
@@ -512,6 +543,10 @@ impl PerfSys for FakeSys {
 
     fn uniform_cores(&self) -> Option<bool> {
         Some(true)
+    }
+
+    fn refer_to_the_cache(&mut self) {
+        self.references += 1;
     }
 }
 
@@ -548,7 +583,7 @@ proptest! {
         });
         let events = 2 * count * threads;
         prop_assert_eq!(perf.set_plan(plan_of(count, typed)), Ok(events as u32));
-        let r = perf.open();
+        let r = perf.open(Set::Basic);
         // EINVAL to the first leader is taken for a kernel that refuses
         // inheritance: the next open, without it, succeeds.
         let refused = errno == libc::EINVAL && at == 0;
@@ -571,10 +606,13 @@ fn a_next_opening_succeeds_after_a_failure() {
         ..FakeSys::default()
     });
     perf.set_plan(plan_of(2, true)).unwrap();
-    assert_eq!(perf.open().unwrap_err().status, Status::NoDescriptor);
+    assert_eq!(
+        perf.open(Set::Basic).unwrap_err().status,
+        Status::NoDescriptor
+    );
     assert!(perf.sys().open.is_empty());
     perf.sys_mut().fail_open = None;
-    perf.open().unwrap();
+    perf.open(Set::Basic).unwrap();
     assert_eq!(perf.sys().open.len(), 4);
 }
 
@@ -588,7 +626,7 @@ fn leaders_count_instructions_and_members_cycles_of_their_kind() {
         let count = if typed { 2 } else { 1 };
         let mut perf = Perf::with(FakeSys::default());
         perf.set_plan(plan_of(count, typed)).unwrap();
-        perf.open().unwrap();
+        perf.open(Set::Basic).unwrap();
         let opened = &perf.sys().opened;
         assert_eq!(opened.len(), 2 * count);
         for (g, pair) in opened.chunks(2).enumerate() {
@@ -626,7 +664,10 @@ fn a_group_that_counts_nothing_is_refused() {
         ..FakeSys::default()
     });
     perf.set_plan(plan_of(1, false)).unwrap();
-    assert_eq!(perf.open().unwrap_err().status, Status::NoCounters);
+    assert_eq!(
+        perf.open(Set::Basic).unwrap_err().status,
+        Status::NoCounters
+    );
     assert!(perf.sys().open.is_empty());
 }
 
@@ -634,9 +675,9 @@ fn a_group_that_counts_nothing_is_refused() {
 fn a_failed_enable_leaves_no_group_on() {
     let mut perf = Perf::with(FakeSys::default());
     perf.set_plan(plan_of(2, true)).unwrap();
-    perf.open().unwrap();
+    perf.open(Set::Basic).unwrap();
     perf.sys_mut().fail_enable_of = Some(103);
-    assert!(perf.enable().is_err());
+    assert!(perf.enable(Set::Basic).is_err());
     assert!(perf.sys().enabled.is_empty());
 }
 
@@ -680,27 +721,32 @@ fn no_free_counter_at_opening_and_a_lost_one_later() {
         ..FakeSys::default()
     });
     perf.set_plan(plan_of(1, false)).unwrap();
-    assert_eq!(perf.open().unwrap_err().status, Status::NoFreeCounter);
+    assert_eq!(
+        perf.open(Set::Basic).unwrap_err().status,
+        Status::NoFreeCounter
+    );
     assert!(perf.sys().open.is_empty());
 
     perf.sys_mut().error_state = false;
-    perf.open().unwrap();
-    perf.enable().unwrap();
-    perf.read().unwrap();
+    perf.open(Set::Basic).unwrap();
+    perf.enable(Set::Basic).unwrap();
+    perf.read(Set::Basic).unwrap();
     perf.sys_mut().error_state = true;
-    assert_eq!(perf.read().unwrap_err().status, Status::CounterLost);
+    assert_eq!(
+        perf.read(Set::Basic).unwrap_err().status,
+        Status::CounterLost
+    );
 }
 
 #[test]
 fn groups_are_added() {
     let mut perf = Perf::with(FakeSys::default());
     perf.set_plan(plan_of(2, true)).unwrap();
-    perf.open().unwrap();
-    perf.enable().unwrap();
-    let c = perf.read().unwrap();
+    perf.open(Set::Basic).unwrap();
+    perf.enable(Set::Basic).unwrap();
+    let c = perf.read(Set::Basic).unwrap();
     // The fake reads 1000 + fd and 2000 + fd for leaders 101 and 103.
-    assert_eq!(c.instructions, 1101 + 1103);
-    assert_eq!(c.cycles, 2101 + 2103);
+    assert_eq!(c, (1101 + 1103, 2101 + 2103));
 }
 
 #[test]
@@ -710,17 +756,17 @@ fn each_thread_has_a_group_of_each_kind() {
         ..FakeSys::default()
     });
     assert_eq!(perf.set_plan(plan_of(2, true)), Ok(12));
-    perf.open().unwrap();
+    perf.open(Set::Basic).unwrap();
     let tids: Vec<i32> = perf.sys().opened.iter().map(|o| o.1).collect();
     assert_eq!(tids, [7, 7, 7, 7, 8, 8, 8, 8, 9, 9, 9, 9]);
-    perf.enable().unwrap();
+    perf.enable(Set::Basic).unwrap();
     assert_eq!(perf.sys().enabled.len(), 6);
     // The fake reads 1000 + fd and 2000 + fd for leaders 101, 103, ...
-    let c = perf.read().unwrap();
+    let c = perf.read(Set::Basic).unwrap();
     let leaders = (0..6).map(|g| 101 + 2 * g);
-    assert_eq!(c.instructions, leaders.clone().map(|fd| 1000 + fd).sum());
-    assert_eq!(c.cycles, leaders.map(|fd| 2000 + fd).sum());
-    perf.disable().unwrap();
+    assert_eq!(c.0, leaders.clone().map(|fd| 1000 + fd).sum::<u64>());
+    assert_eq!(c.1, leaders.map(|fd| 2000 + fd).sum::<u64>());
+    perf.disable(Set::Basic).unwrap();
     assert!(perf.sys().enabled.is_empty());
 }
 
@@ -733,12 +779,12 @@ fn a_thread_that_ended_is_left_out() {
     });
     // Its descriptors were planned; it uses none of them.
     assert_eq!(perf.set_plan(plan_of(2, true)), Ok(12));
-    perf.open().unwrap();
+    perf.open(Set::Basic).unwrap();
     assert_eq!(perf.sys().open.len(), 8);
     assert!(perf.sys().opened.iter().all(|o| o.1 != 8));
-    perf.enable().unwrap();
+    perf.enable(Set::Basic).unwrap();
     assert_eq!(perf.sys().enabled.len(), 4);
-    perf.read().unwrap();
+    perf.read(Set::Basic).unwrap();
 }
 
 proptest! {
@@ -752,7 +798,7 @@ proptest! {
             ..FakeSys::default()
         });
         perf.set_plan(plan_of(2, true)).unwrap();
-        prop_assert_eq!(perf.open(), Ok(()));
+        prop_assert_eq!(perf.open(Set::Basic), Ok(()));
         let sys = perf.sys();
         let tids: BTreeSet<i32> = sys.open.iter().map(|fd| sys.tid_of[fd]).collect();
         prop_assert_eq!(tids, BTreeSet::from([7, 9]));
@@ -768,7 +814,7 @@ fn a_kernel_that_refuses_inheritance_counts_the_listed_threads() {
         ..FakeSys::default()
     });
     perf.set_plan(plan_of(2, true)).unwrap();
-    perf.open().unwrap();
+    perf.open(Set::Basic).unwrap();
     assert!(!perf.inherits());
     let sys = perf.sys();
     assert_eq!(sys.open.len(), 8);
@@ -788,7 +834,7 @@ fn an_einval_after_the_first_leader_is_an_error() {
         ..FakeSys::default()
     });
     perf.set_plan(plan_of(2, true)).unwrap();
-    let e = perf.open().unwrap_err();
+    let e = perf.open(Set::Basic).unwrap_err();
     assert_eq!(e, open_error(libc::EINVAL, true));
     assert!(perf.inherits());
     assert!(perf.sys().open.is_empty());
@@ -842,6 +888,248 @@ proptest! {
 }
 
 // ---------------------------------------------------------------------
+// The other sets of events
+// ---------------------------------------------------------------------
+
+/// A Perf with the basic set open over two kinds of cores, on the
+/// threads `list`.
+fn basic_open(list: Vec<i32>) -> Perf<FakeSys> {
+    let mut perf = Perf::with(FakeSys {
+        list: Some(Ok(list)),
+        ..FakeSys::default()
+    });
+    perf.set_plan(plan_of(2, true)).unwrap();
+    perf.open(Set::Basic).unwrap();
+    perf
+}
+
+#[test]
+fn a_set_opens_its_own_events_after_the_basic_one() {
+    use pmu_counters::counters::perf_abi::{PERF_FORMAT_GROUP, PERF_TYPE_HARDWARE};
+    for set in [Set::Branches, Set::Cache] {
+        let mut perf = basic_open(vec![7]);
+        let before = perf.sys().opened.len();
+        assert_eq!(perf.plan_set(set), Ok(4));
+        perf.open(set).unwrap();
+        let opened = &perf.sys().opened[before..];
+        assert_eq!(opened.len(), 4);
+        let (first, second) = events_of(set);
+        for (g, pair) in opened.chunks(2).enumerate() {
+            let unit = (8 + g as u64) << 32;
+            assert_eq!(pair[0].0.config, first | unit);
+            assert_eq!(pair[1].0.config, second | unit);
+            assert_eq!(pair[0].0.flags, LEADER_FLAGS);
+            assert_eq!(pair[1].0.flags, MEMBER_FLAGS);
+            for (attr, tid, _) in pair {
+                assert_eq!(attr.type_, PERF_TYPE_HARDWARE);
+                assert_eq!(attr.read_format, PERF_FORMAT_GROUP);
+                assert_eq!(*tid, 7);
+            }
+            assert_eq!(pair[0].2, -1);
+        }
+        assert_eq!(perf.sys().open.len(), 8);
+    }
+    assert_eq!(
+        events_of(Set::Branches),
+        (4, 5),
+        "PERF_COUNT_HW_BRANCH_INSTRUCTIONS and PERF_COUNT_HW_BRANCH_MISSES"
+    );
+    assert_eq!(
+        events_of(Set::Cache),
+        (2, 3),
+        "PERF_COUNT_HW_CACHE_REFERENCES and PERF_COUNT_HW_CACHE_MISSES"
+    );
+}
+
+#[test]
+fn a_set_is_planned_on_the_kinds_of_the_basic_one() {
+    let mut perf = Perf::with(FakeSys::default());
+    assert_eq!(
+        perf.plan_set(Set::Branches).unwrap_err().status,
+        Status::Internal
+    );
+    assert_eq!(perf.open(Set::Cache).unwrap_err().status, Status::Internal);
+}
+
+#[test]
+fn opening_a_set_leaves_the_others_as_they_are() {
+    let mut perf = basic_open(vec![7]);
+    perf.enable(Set::Basic).unwrap();
+    let basic: BTreeSet<i32> = perf.sys().enabled.clone();
+    assert_eq!(basic.len(), 2);
+    perf.plan_set(Set::Branches).unwrap();
+    let ioctls = perf.sys().ioctls.len();
+    perf.open(Set::Branches).unwrap();
+    // The check of the new set enabled and disabled only its leaders.
+    let fds: BTreeSet<i32> = perf.sys().ioctls[ioctls..].iter().map(|i| i.0).collect();
+    assert!(fds.is_disjoint(&basic), "{fds:?} {basic:?}");
+    assert_eq!(perf.sys().enabled, basic);
+    perf.enable(Set::Branches).unwrap();
+    assert_eq!(perf.sys().enabled.len(), 4);
+    perf.disable(Set::Basic).unwrap();
+    assert!(perf.sys().enabled.is_disjoint(&basic));
+    assert_eq!(perf.sys().enabled.len(), 2);
+    // Each set reads its own leaders.
+    let read = |perf: &mut Perf<FakeSys>, set| perf.read(set).unwrap();
+    let branches = read(&mut perf, Set::Branches);
+    let leaders: Vec<i32> = perf.sys().enabled.iter().copied().collect();
+    assert_eq!(
+        branches.0,
+        leaders.iter().map(|&fd| 1000 + fd as u64).sum::<u64>()
+    );
+}
+
+#[test]
+fn a_set_lists_the_threads_when_it_is_planned() {
+    let mut perf = basic_open(vec![7]);
+    perf.sys_mut().list = Some(Ok(vec![7, 8]));
+    let before = perf.sys().opened.len();
+    assert_eq!(perf.plan_set(Set::Cache), Ok(8));
+    perf.open(Set::Cache).unwrap();
+    let tids: Vec<i32> = perf.sys().opened[before..].iter().map(|o| o.1).collect();
+    assert_eq!(tids, [7, 7, 7, 7, 8, 8, 8, 8]);
+}
+
+/// A group of the other sets that reads zero counts nothing, as under a
+/// hypervisor that opens it but hides its events: the calling thread
+/// took branches and referred to the cache in between.
+#[test]
+fn a_set_whose_counters_read_zero_is_refused() {
+    for set in [Set::Branches, Set::Cache] {
+        let mut perf = basic_open(vec![7]);
+        let basic = perf.sys().open.clone();
+        perf.sys_mut().instructions = Some(0);
+        perf.plan_set(set).unwrap();
+        assert_eq!(perf.open(set).unwrap_err().status, Status::EventsNotCounted);
+        assert_eq!(perf.sys().open, basic);
+        perf.sys_mut().instructions = None;
+        perf.plan_set(set).unwrap();
+        assert_eq!(perf.open(set), Ok(()));
+    }
+}
+
+#[test]
+fn a_set_without_a_free_counter_is_closed_alone() {
+    let mut perf = basic_open(vec![7]);
+    let basic = perf.sys().open.clone();
+    perf.sys_mut().error_state = true;
+    perf.plan_set(Set::Cache).unwrap();
+    assert_eq!(
+        perf.open(Set::Cache).unwrap_err().status,
+        Status::NoFreeCounter
+    );
+    assert_eq!(perf.sys().open, basic);
+}
+
+/// The check of the cache refers to it first: a group of the cache that
+/// counts reads zero until then.
+#[test]
+fn the_cache_is_referred_to_before_its_check() {
+    let mut perf = basic_open(vec![7]);
+    perf.sys_mut().cache_needs_a_reference = true;
+    perf.plan_set(Set::Cache).unwrap();
+    assert_eq!(perf.open(Set::Cache), Ok(()));
+    assert_eq!(perf.sys().references, 1);
+    // Only the cache needs it.
+    perf.plan_set(Set::Branches).unwrap();
+    perf.open(Set::Branches).unwrap();
+    assert_eq!(perf.sys().references, 1);
+}
+
+/// Where the reference flushes the line, it misses the cache too: a group
+/// whose misses read zero counts nothing. Elsewhere misses may be zero.
+#[test]
+fn misses_of_the_cache_that_read_zero_are_refused_where_lines_are_flushed() {
+    let mut perf = basic_open(vec![7]);
+    perf.sys_mut().second = Some(0);
+    perf.plan_set(Set::Cache).unwrap();
+    let r = perf.open(Set::Cache);
+    if FLUSHES {
+        assert_eq!(r.unwrap_err().status, Status::EventsNotCounted);
+    } else {
+        assert_eq!(r, Ok(()));
+    }
+    // The branches mispredicted may well be none so soon.
+    perf.plan_set(Set::Branches).unwrap();
+    assert_eq!(perf.open(Set::Branches), Ok(()));
+}
+
+proptest! {
+    /// A set that fails at any of its opens closes all it opened, and
+    /// only that: the basic set stays open, and a later opening of the
+    /// set succeeds.
+    #[test]
+    fn a_failed_opening_of_a_set_closes_only_it(at in 0usize..8,
+                                                errno in prop::sample::select(&ERRNOS[..]),
+                                                cache in any::<bool>()) {
+        let set = if cache { Set::Cache } else { Set::Branches };
+        let mut perf = basic_open(vec![7, 8]);
+        let basic = perf.sys().open.clone();
+        let opens = perf.sys().opens;
+        perf.sys_mut().fail_open = Some((opens + at, errno));
+        perf.plan_set(set).unwrap();
+        let r = perf.open(set);
+        // No EINVAL is taken for a refusal of inheritance any more.
+        prop_assert_eq!(r, Err(open_error_of(set, errno, true)));
+        prop_assert!(perf.inherits());
+        prop_assert_eq!(&perf.sys().open, &basic);
+        perf.sys_mut().fail_open = None;
+        perf.plan_set(set).unwrap();
+        prop_assert_eq!(perf.open(set), Ok(()));
+        prop_assert_eq!(perf.sys().open.len(), basic.len() * 2);
+    }
+}
+
+#[test]
+fn errors_of_the_other_sets_mean_what_the_design_says() {
+    let table = [
+        (libc::ENOENT, Status::EventsNotCounted),
+        (libc::EOPNOTSUPP, Status::EventsNotCounted),
+        (libc::ENODEV, Status::EventsNotCounted),
+        (libc::EINVAL, Status::EventsNotCounted),
+        (libc::EACCES, Status::NotPermitted),
+        (libc::EBUSY, Status::NoFreeCounter),
+        (libc::EMFILE, Status::NoDescriptor),
+        (libc::EIO, Status::SystemError),
+    ];
+    for set in [Set::Branches, Set::Cache] {
+        for (errno, status) in table {
+            for typed in [false, true] {
+                let e = open_error_of(set, errno, typed);
+                assert_eq!((e.status, e.os_error), (status, errno), "{set:?} {errno}");
+            }
+        }
+    }
+    for errno in ERRNOS {
+        for typed in [false, true] {
+            assert_eq!(
+                open_error_of(Set::Basic, errno, typed),
+                open_error(errno, typed)
+            );
+        }
+    }
+}
+
+#[test]
+fn a_kernel_that_refuses_inheritance_opens_the_other_sets_without_it() {
+    let mut perf = Perf::with(FakeSys {
+        refuse_inherit: true,
+        ..FakeSys::default()
+    });
+    perf.set_plan(plan_of(1, false)).unwrap();
+    perf.open(Set::Basic).unwrap();
+    let before = perf.sys().opened.len();
+    perf.plan_set(Set::Branches).unwrap();
+    perf.open(Set::Branches).unwrap();
+    let sys = perf.sys();
+    assert!(
+        sys.opened[before..]
+            .iter()
+            .all(|o| o.0.flags & FLAG_INHERIT == 0)
+    );
+}
+
+// ---------------------------------------------------------------------
 // The cells
 // ---------------------------------------------------------------------
 
@@ -861,7 +1149,7 @@ enum Gen {
 enum CellOp {
     Take,
     Enter(Gen),
-    Add(u32, u32),
+    Add([u32; 6]),
     Fail(u32),
     Leave,
     Read(Gen),
@@ -884,7 +1172,7 @@ fn cell_op() -> impl Strategy<Value = CellOp> {
     prop_oneof![
         Just(CellOp::Take),
         gen_sel().prop_map(CellOp::Enter),
-        (any::<u32>(), any::<u32>()).prop_map(|(i, c)| CellOp::Add(i, c)),
+        any::<[u32; 6]>().prop_map(CellOp::Add),
         any::<u32>().prop_map(CellOp::Fail),
         Just(CellOp::Leave),
         gen_sel().prop_map(CellOp::Read),
@@ -1006,10 +1294,14 @@ proptest! {
                     prop_assert_eq!(cell.enter(g), m.enter(g));
                 }
                 // A worker adds only after it entered.
-                CellOp::Add(i, c) if m.taken() && m.w > 0 => {
-                    cell.add(u64::from(i), u64::from(c));
-                    m.sums.instructions = m.sums.instructions.wrapping_add(u64::from(i));
-                    m.sums.cycles = m.sums.cycles.wrapping_add(u64::from(c));
+                CellOp::Add(values) if m.taken() && m.w > 0 => {
+                    let values = values.map(u64::from);
+                    cell.add(&Counts::from_array(values));
+                    let mut sums = m.sums.counts.to_array();
+                    for (sum, v) in sums.iter_mut().zip(values) {
+                        *sum = sum.wrapping_add(v);
+                    }
+                    m.sums.counts = Counts::from_array(sums);
                 }
                 CellOp::Fail(code) if m.taken() && m.w > 0 => {
                     cell.fail(code);

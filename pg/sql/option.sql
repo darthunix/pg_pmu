@@ -31,7 +31,7 @@ SET auto_explain.log_extension_options = 'pmu on';
 \set VERBOSITY default
 SET auto_explain.log_extension_options = 'pmu';
 
-SELECT size = 16 + 32 * (current_setting('max_connections')::int
+SELECT size = 16 + 64 * (current_setting('max_connections')::int
                          + current_setting('autovacuum_worker_slots')::int
                          + current_setting('max_worker_processes')::int
                          + current_setting('max_wal_senders')::int + 2

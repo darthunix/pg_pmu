@@ -39,12 +39,30 @@
 #define PMU_NO_CELL				14	/* 53000 */
 #define PMU_BAD_TOKEN			15	/* XX000 */
 #define PMU_TOO_MANY_THREADS	16	/* 0A000 */
+#define PMU_EVENTS_NOT_COUNTED	17	/* 0A000 */
 
-/* Instructions and cycles counted so far; only differences mean much. */
+/*
+ * The sets of events, pairs counted together, as bits of a mask: the
+ * basic one, which every counting statement counts, then those a
+ * statement asks for. The kernel's generic events count the cache, and
+ * which level of it depends on the processor.
+ */
+#define PMU_EVENTS_BASIC		1	/* instructions and cycles */
+#define PMU_EVENTS_BRANCHES		2	/* branches and branch misses */
+#define PMU_EVENTS_CACHE		4	/* cache references and cache misses */
+
+/*
+ * The values counted so far, two of each set; those of a set that was
+ * not read are 0. Only differences mean much.
+ */
 typedef struct PmuCounts
 {
 	uint64_t	instructions;
 	uint64_t	cycles;
+	uint64_t	branches;
+	uint64_t	branch_misses;
+	uint64_t	cache_references;
+	uint64_t	cache_misses;
 } PmuCounts;
 
 /* The crate's sizes and offsets of the types above. */
@@ -55,6 +73,7 @@ typedef struct PmuLayout
 	uint32_t	perf_abi_size;
 	uint32_t	contents_size;
 	uint32_t	contents_failures;
+	uint32_t	counts_cache_misses;
 } PmuLayout;
 
 extern void pmu_counters_layout(PmuLayout *out);
@@ -81,23 +100,31 @@ typedef struct PmuPerfAbi
 	uint64_t	ioc_enable;
 	uint64_t	ioc_disable;
 	uint64_t	ioc_flag_group;
+	uint64_t	hw_cache_references;
+	uint64_t	hw_cache_misses;
+	uint64_t	hw_branch_instructions;
+	uint64_t	hw_branch_misses;
 } PmuPerfAbi;
 
 extern void pmu_counters_perf_abi(PmuPerfAbi *out);
 
 /*
- * The counters of this process. Plan, take the descriptors it asks
- * for from PostgreSQL's budget, open, and give the descriptors back if
- * the opening fails. Then each counting statement or execution of a
- * worker acquires, reads, and releases; the counters count while a
- * reference is held. sysfs is the root of sysfs, "/sys".
+ * The counters of this process. For each set, the basic one first, plan,
+ * take the descriptors it asks for from PostgreSQL's budget, open, and
+ * give the descriptors back if the opening fails; set is the bit of one
+ * set, and a set stays open once opened. Then each counting statement or
+ * execution of a worker acquires, reads, and releases the sets of a mask;
+ * a set counts while a reference to it is held, and an acquire that fails
+ * takes no reference. sysfs is the root of sysfs, "/sys".
  */
-extern int32_t pmu_counters_plan(const char *sysfs, uint32_t *descriptors,
+extern int32_t pmu_counters_plan(const char *sysfs, uint32_t set,
+								 uint32_t *descriptors, int32_t *os_error);
+extern int32_t pmu_counters_open(uint32_t set, int32_t *os_error);
+extern int32_t pmu_counters_acquire(uint32_t sets, PmuCounts *now,
+									int32_t *os_error);
+extern int32_t pmu_counters_read(uint32_t sets, PmuCounts *now,
 								 int32_t *os_error);
-extern int32_t pmu_counters_open(int32_t *os_error);
-extern int32_t pmu_counters_acquire(PmuCounts *now, int32_t *os_error);
-extern int32_t pmu_counters_read(PmuCounts *now, int32_t *os_error);
-extern int32_t pmu_counters_release(int32_t *os_error);
+extern int32_t pmu_counters_release(uint32_t sets, int32_t *os_error);
 
 /*
  * The cells of the memory "pg_pmu", where the parallel workers of a
@@ -110,8 +137,7 @@ extern int32_t pmu_counters_release(int32_t *os_error);
 /* What a cell held when it was given back. */
 typedef struct PmuCellContents
 {
-	uint64_t	instructions;
-	uint64_t	cycles;
+	PmuCounts	counts;			/* the sums of the workers' counts */
 	uint32_t	failures;		/* workers that could not count */
 	uint32_t	sqlstate;		/* of the last of them */
 } PmuCellContents;
@@ -157,7 +183,7 @@ extern int32_t pmu_token_parse(const void *base, const char *text,
  * PMU_BAD_TOKEN or PMU_STALE_TOKEN and adding nothing.
  */
 extern int32_t pmu_cell_report(const void *base, uint64_t token,
-							   uint64_t instructions, uint64_t cycles);
+							   const PmuCounts *counts);
 extern int32_t pmu_cell_report_failure(const void *base, uint64_t token,
 									   uint32_t sqlstate);
 

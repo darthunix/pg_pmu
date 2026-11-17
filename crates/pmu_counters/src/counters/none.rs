@@ -3,7 +3,7 @@
 
 use core::ffi::CStr;
 
-use super::{Backend, Counts};
+use super::{Backend, Set};
 use crate::{Error, Status};
 
 /// Refuses to open, so nothing else is ever called.
@@ -22,23 +22,23 @@ impl Default for Unsupported {
 }
 
 impl Backend for Unsupported {
-    fn plan(&mut self, _: &CStr) -> Result<u32, Error> {
+    fn plan(&mut self, _: &CStr, _: Set) -> Result<u32, Error> {
         Ok(0)
     }
 
-    fn open(&mut self) -> Result<(), Error> {
+    fn open(&mut self, _: Set) -> Result<(), Error> {
         Err(Error::new(Status::NoSystem))
     }
 
-    fn enable(&mut self) -> Result<(), Error> {
+    fn enable(&mut self, _: Set) -> Result<(), Error> {
         Err(Error::new(Status::Internal))
     }
 
-    fn disable(&mut self) -> Result<(), Error> {
+    fn disable(&mut self, _: Set) -> Result<(), Error> {
         Err(Error::new(Status::Internal))
     }
 
-    fn read(&mut self) -> Result<Counts, Error> {
+    fn read(&mut self, _: Set) -> Result<(u64, u64), Error> {
         Err(Error::new(Status::Internal))
     }
 }

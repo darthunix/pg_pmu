@@ -35,21 +35,23 @@ pmu_check_layout(void)
 	pmu_counters_layout(&layout);
 	if (layout.counts_size != sizeof(PmuCounts) ||
 		layout.counts_cycles != offsetof(PmuCounts, cycles) ||
+		layout.counts_cache_misses != offsetof(PmuCounts, cache_misses) ||
 		layout.perf_abi_size != sizeof(PmuPerfAbi) ||
 		layout.contents_size != sizeof(PmuCellContents) ||
 		layout.contents_failures != offsetof(PmuCellContents, failures))
 		ereport(ERROR,
 				(errcode(ERRCODE_INTERNAL_ERROR),
 				 errmsg("pmu_counters.h does not match the crate pmu_counters"),
-				 errdetail("PmuCounts has %u bytes and cycles at %u, PmuPerfAbi "
-						   "%u bytes, PmuCellContents %u bytes and failures at "
-						   "%u in the crate; %zu, %zu, %zu, %zu and %zu in the "
-						   "header.",
+				 errdetail("PmuCounts has %u bytes, cycles at %u and cache_misses "
+						   "at %u, PmuPerfAbi %u bytes, PmuCellContents %u "
+						   "bytes and failures at %u in the crate; %zu, %zu, "
+						   "%zu, %zu, %zu and %zu in the header.",
 						   layout.counts_size, layout.counts_cycles,
-						   layout.perf_abi_size, layout.contents_size,
-						   layout.contents_failures, sizeof(PmuCounts),
-						   offsetof(PmuCounts, cycles), sizeof(PmuPerfAbi),
-						   sizeof(PmuCellContents),
+						   layout.counts_cache_misses, layout.perf_abi_size,
+						   layout.contents_size, layout.contents_failures,
+						   sizeof(PmuCounts), offsetof(PmuCounts, cycles),
+						   offsetof(PmuCounts, cache_misses),
+						   sizeof(PmuPerfAbi), sizeof(PmuCellContents),
 						   offsetof(PmuCellContents, failures))));
 }
 
@@ -119,5 +121,9 @@ pmu_check_perf_abi(void)
 	PMU_CHECK(abi.ioc_enable, PERF_EVENT_IOC_ENABLE);
 	PMU_CHECK(abi.ioc_disable, PERF_EVENT_IOC_DISABLE);
 	PMU_CHECK(abi.ioc_flag_group, PERF_IOC_FLAG_GROUP);
+	PMU_CHECK(abi.hw_cache_references, PERF_COUNT_HW_CACHE_REFERENCES);
+	PMU_CHECK(abi.hw_cache_misses, PERF_COUNT_HW_CACHE_MISSES);
+	PMU_CHECK(abi.hw_branch_instructions, PERF_COUNT_HW_BRANCH_INSTRUCTIONS);
+	PMU_CHECK(abi.hw_branch_misses, PERF_COUNT_HW_BRANCH_MISSES);
 #endif
 }

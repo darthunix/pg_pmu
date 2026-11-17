@@ -9,7 +9,7 @@ use core::ffi::{CStr, c_char};
 use core::mem::{offset_of, size_of};
 
 use crate::cells::{self, Cell, Contents, Header, LOW_MASK};
-use crate::counters::{Counters, Counts, Platform, platform};
+use crate::counters::{Counters, Counts, Platform, Set, platform};
 use crate::{Error, Status};
 
 /// The counters of this process.
@@ -64,6 +64,7 @@ pub struct PmuLayout {
     pub perf_abi_size: u32,
     pub contents_size: u32,
     pub contents_failures: u32,
+    pub counts_cache_misses: u32,
 }
 
 /// Fill the layout of the shared types.
@@ -82,6 +83,7 @@ pub unsafe extern "C" fn pmu_counters_layout(out: *mut PmuLayout) {
         perf_abi_size: size_of::<PmuPerfAbi>() as u32,
         contents_size: size_of::<Contents>() as u32,
         contents_failures: offset_of!(Contents, failures) as u32,
+        counts_cache_misses: offset_of!(Counts, cache_misses) as u32,
     };
     // SAFETY: see above.
     unsafe { out.write(layout) };
@@ -108,6 +110,10 @@ pub struct PmuPerfAbi {
     pub ioc_enable: u64,
     pub ioc_disable: u64,
     pub ioc_flag_group: u64,
+    pub hw_cache_references: u64,
+    pub hw_cache_misses: u64,
+    pub hw_branch_instructions: u64,
+    pub hw_branch_misses: u64,
 }
 
 /// Fill what the crate uses of perf events.
@@ -137,14 +143,24 @@ pub unsafe extern "C" fn pmu_counters_perf_abi(out: *mut PmuPerfAbi) {
         ioc_enable: abi::PERF_EVENT_IOC_ENABLE,
         ioc_disable: abi::PERF_EVENT_IOC_DISABLE,
         ioc_flag_group: abi::PERF_IOC_FLAG_GROUP,
+        hw_cache_references: abi::PERF_COUNT_HW_CACHE_REFERENCES,
+        hw_cache_misses: abi::PERF_COUNT_HW_CACHE_MISSES,
+        hw_branch_instructions: abi::PERF_COUNT_HW_BRANCH_INSTRUCTIONS,
+        hw_branch_misses: abi::PERF_COUNT_HW_BRANCH_MISSES,
     };
     // SAFETY: see above.
     unsafe { out.write(values) };
 }
 
-/// Find what must be opened, and write how many file descriptors the
-/// opening needs, from PostgreSQL's budget of external files; 0 once
-/// the counters are open.
+/// The set of a mask with exactly its bit, or an internal error.
+fn set_of(bit: u32) -> Result<Set, Error> {
+    Set::of_bit(bit).ok_or(Error::new(Status::Internal))
+}
+
+/// Find what must be opened for the set of the bit `set`, and write how
+/// many file descriptors the opening needs, from PostgreSQL's budget of
+/// external files; 0 once the set is open. A set other than the basic
+/// one is planned once the basic one is open.
 ///
 /// # Safety
 ///
@@ -153,6 +169,7 @@ pub unsafe extern "C" fn pmu_counters_perf_abi(out: *mut PmuPerfAbi) {
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn pmu_counters_plan(
     sysfs: *const c_char,
+    set: u32,
     descriptors: *mut u32,
     os_error: *mut i32,
 ) -> i32 {
@@ -160,9 +177,10 @@ pub unsafe extern "C" fn pmu_counters_plan(
         if sysfs.is_null() || descriptors.is_null() {
             return Err(Error::new(Status::Internal));
         }
+        let set = set_of(set)?;
         // SAFETY: C passes a string ending in zero.
         let sysfs = unsafe { CStr::from_ptr(sysfs) };
-        let n = with_counters(|c| c.plan(sysfs))?;
+        let n = with_counters(|c| c.plan(sysfs, set))?;
         // SAFETY: C passes the address of a uint32_t.
         unsafe { descriptors.write(n) };
         Ok(())
@@ -170,60 +188,69 @@ pub unsafe extern "C" fn pmu_counters_plan(
     finish(result, os_error)
 }
 
-/// Open the counters, once in the process. On an error nothing stays
-/// open, and the caller gives back the descriptors it took.
+/// Open the counters of the set of the bit `set`, once in the process.
+/// On an error nothing of the set stays open, and the caller gives back
+/// the descriptors it took for it.
 ///
 /// # Safety
 ///
 /// `os_error` is the address of an `int32_t`, or null.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn pmu_counters_open(os_error: *mut i32) -> i32 {
-    finish(with_counters(|c| c.open()), os_error)
+pub unsafe extern "C" fn pmu_counters_open(set: u32, os_error: *mut i32) -> i32 {
+    finish(
+        set_of(set).and_then(|set| with_counters(|c| c.open(set))),
+        os_error,
+    )
 }
 
-/// Take a reference to the counters and read them.
+/// Take a reference to each set of the mask `sets` and read them; the
+/// values of the other sets are 0.
 ///
 /// # Safety
 ///
 /// `now` is the address of a `PmuCounts`; `os_error` that of an
 /// `int32_t`, or null.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn pmu_counters_acquire(now: *mut Counts, os_error: *mut i32) -> i32 {
+pub unsafe extern "C" fn pmu_counters_acquire(
+    sets: u32,
+    now: *mut Counts,
+    os_error: *mut i32,
+) -> i32 {
     let result = (|| {
         if now.is_null() {
             return Err(Error::new(Status::Internal));
         }
-        let counts = with_counters(|c| c.acquire())?;
+        let counts = with_counters(|c| c.acquire(sets))?;
         store(now, counts)
     })();
     finish(result, os_error)
 }
 
-/// Read the counters while a reference is held.
+/// Read the sets of the mask `sets` while a reference to each is held.
 ///
 /// # Safety
 ///
 /// As for [`pmu_counters_acquire`].
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn pmu_counters_read(now: *mut Counts, os_error: *mut i32) -> i32 {
+pub unsafe extern "C" fn pmu_counters_read(sets: u32, now: *mut Counts, os_error: *mut i32) -> i32 {
     let result = (|| {
         if now.is_null() {
             return Err(Error::new(Status::Internal));
         }
-        let counts = with_counters(|c| c.read())?;
+        let counts = with_counters(|c| c.read(sets))?;
         store(now, counts)
     })();
     finish(result, os_error)
 }
 
-/// Give a reference back.
+/// Give back a reference to each set of the mask `sets`.
 ///
 /// # Safety
 ///
 /// `os_error` is the address of an `int32_t`, or null.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn pmu_counters_release(os_error: *mut i32) -> i32 {
-    finish(with_counters(|c| c.release()), os_error)
+pub unsafe extern "C" fn pmu_counters_release(sets: u32, os_error: *mut i32) -> i32 {
+    finish(with_counters(|c| c.release(sets)), os_error)
 }
 
 // ---------------------------------------------------------------------
@@ -462,18 +489,24 @@ pub unsafe extern "C" fn pmu_token_parse(
 ///
 /// # Safety
 ///
-/// `base` as for `pmu_cell_take`.
+/// `base` as for `pmu_cell_take`; `counts` the address of a
+/// `PmuCounts`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn pmu_cell_report(
     base: *const u8,
     token: u64,
-    instructions: u64,
-    cycles: u64,
+    counts: *const Counts,
 ) -> i32 {
+    if counts.is_null() {
+        return Status::Internal as i32;
+    }
+    // SAFETY: C passes the address of a PmuCounts, which it does not
+    // change during the call.
+    let counts = unsafe { counts.read() };
     // SAFETY: see above.
     code(unsafe { cell_of(base, token) }.and_then(|(cell, g)| {
         cell.enter(g)?;
-        cell.add(instructions, cycles);
+        cell.add(&counts);
         cell.leave()
     }))
 }

@@ -172,10 +172,12 @@ impl Path {
         };
         for part in parts {
             let end = p.len.checked_add(part.len()).ok_or(Malformed)?;
-            p.buf
-                .get_mut(p.len..end)
-                .ok_or(Malformed)?
-                .copy_from_slice(part);
+            // Byte by byte: copy_from_slice keeps a panic for slices of
+            // other lengths wherever the compiler cannot see they agree.
+            let room = p.buf.get_mut(p.len..end).ok_or(Malformed)?;
+            for (to, from) in room.iter_mut().zip(part.iter()) {
+                *to = *from;
+            }
             p.len = end;
         }
         Ok(p)
