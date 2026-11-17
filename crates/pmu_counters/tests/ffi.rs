@@ -9,6 +9,7 @@
 
 use pmu_counters::Status;
 use pmu_counters::cells::{Contents, LOW_MASK, split};
+use pmu_counters::counters::Counts;
 use pmu_counters::ffi::{
     pmu_cell_give_back, pmu_cell_read, pmu_cell_report, pmu_cell_report_failure, pmu_cell_take,
     pmu_cell_take_pool, pmu_cells_init, pmu_cells_size, pmu_token_parse,
@@ -19,7 +20,7 @@ const OK: i32 = Status::Ok as i32;
 /// Memory for `n` cells of the backends and `k` of the pool, set up.
 fn memory(n: u32, k: u32) -> Vec<u64> {
     let size = pmu_cells_size(n, k);
-    assert_eq!(size, 16 + 32 * (n + k) as usize);
+    assert_eq!(size, 16 + 64 * (n + k) as usize);
     let mut mem = vec![u64::MAX; size / 8];
     assert_eq!(unsafe { pmu_cells_init(mem.as_mut_ptr().cast(), n, k) }, OK);
     mem
@@ -153,12 +154,14 @@ fn workers_report_into_the_cell_of_their_token() {
     let mut token = 0;
     assert_eq!(unsafe { pmu_cell_take_pool(base, &mut token) }, OK);
 
-    assert_eq!(unsafe { pmu_cell_report(base, token, 10, 20) }, OK);
-    assert_eq!(unsafe { pmu_cell_report(base, token, 1, 2) }, OK);
+    let report = |token: u64, values: [u64; 6]| unsafe {
+        pmu_cell_report(base, token, &Counts::from_array(values))
+    };
+    assert_eq!(report(token, [10, 20, 30, 40, 50, 60]), OK);
+    assert_eq!(report(token, [1, 2, 3, 4, 5, 6]), OK);
     assert_eq!(unsafe { pmu_cell_report_failure(base, token, 53) }, OK);
     let want = Contents {
-        instructions: 11,
-        cycles: 22,
+        counts: Counts::from_array([11, 22, 33, 44, 55, 66]),
         failures: 1,
         sqlstate: 53,
     };
@@ -166,9 +169,10 @@ fn workers_report_into_the_cell_of_their_token() {
     assert_eq!(give_back(base, token), Ok(want));
 
     // After the return the token is old, and nothing is added.
+    assert_eq!(report(token, [5; 6]), Status::StaleToken as i32);
     assert_eq!(
-        unsafe { pmu_cell_report(base, token, 5, 5) },
-        Status::StaleToken as i32
+        unsafe { pmu_cell_report(base, token, std::ptr::null()) },
+        Status::Internal as i32
     );
     assert_eq!(
         unsafe { pmu_cell_report_failure(base, token, 53) },
@@ -180,10 +184,7 @@ fn workers_report_into_the_cell_of_their_token() {
     // Tokens that are not valid: no cell, a cell beyond the memory, an
     // even generation; nothing is added anywhere.
     for bad in [0, (1 << 20) | 9, (2 << 20) | 1] {
-        assert_eq!(
-            unsafe { pmu_cell_report(base, bad, 5, 5) },
-            Status::BadToken as i32
-        );
+        assert_eq!(report(bad, [5; 6]), Status::BadToken as i32);
         assert_eq!(
             unsafe { pmu_cell_report_failure(base, bad, 53) },
             Status::BadToken as i32

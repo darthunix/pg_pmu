@@ -167,7 +167,7 @@ difference is the workers' part.
 ### Shared memory
 
 ```
- "pg_pmu", 16 + 32 * (N + K) bytes, allocated at server start
+ "pg_pmu", 16 + 64 * (N + K) bytes, allocated at server start
 
  ┌────────┬──────────────────────────┬────────────────────┐
  │ header │ N cells, one per backend │ K cells, a pool    │
@@ -176,11 +176,14 @@ difference is the workers' part.
 
  header: N (u32) | K (u32) | zero (u64)
 
- cell, 32 bytes
- ┌──────────────┬────────┬───────┬──────────┬──────────┐
- │ instructions │ cycles │ state │ failures │ sqlstate │
- │ u64          │ u64    │ u64   │ u32      │ u32      │
- └──────────────┴────────┴───────┴──────────┴──────────┘
+ cell, 64 bytes
+ ┌──────────────────────────────┬───────┬──────────┬──────────┐
+ │ sums, 6 × u64: instructions, │ state │ failures │ sqlstate │
+ │ cycles, branches, branch     │ u64   │ u32      │ u32      │
+ │ misses, cache references,    │       │          │          │
+ │ cache misses                 │       │          │          │
+ └──────────────────────────────┴───────┴──────────┴──────────┘
+  0                              48      56         60
 
  state:  bits 63..20 generation G   bits 19..0 writers W
  token:  bits 63..20 generation G   bits 19..0 cell number + 1
@@ -188,7 +191,7 @@ difference is the workers' part.
 
 N is PostgreSQL's maximum number of backends, K is
 `pg_pmu.max_nested` (default 16). With default settings that is about
-5 KB. The outermost counting statement of a backend uses the
+10 KB. The outermost counting statement of a backend uses the
 backend's own cell; a counting EXPLAIN nested inside it takes a cell
 from the pool, which the whole server shares, or fails with 53000 if
 none is free. An EXPLAIN that a parallel worker runs takes no cell:

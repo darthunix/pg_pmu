@@ -53,7 +53,7 @@ ERROR:  22023
 SET auto_explain.log_extension_options = 'pmu';
 ERROR:  EXPLAIN option "pmu" cannot be used by auto_explain
 DETAIL:  auto_explain explains a plan after it has run, when nothing was counted.
-SELECT size = 16 + 32 * (current_setting('max_connections')::int
+SELECT size = 16 + 64 * (current_setting('max_connections')::int
                          + current_setting('autovacuum_worker_slots')::int
                          + current_setting('max_worker_processes')::int
                          + current_setting('max_wal_senders')::int + 2

@@ -3,7 +3,7 @@
 use std::sync::{Mutex, MutexGuard};
 
 use pmu_counters::Status;
-use pmu_counters::counters::{Counters, Platform, platform};
+use pmu_counters::counters::{Counters, Platform, Set, platform};
 
 /// One test of a binary counts at a time. Counters of the whole process
 /// open groups on the threads of the other tests too, and groups of two
@@ -40,16 +40,46 @@ pub fn counters() -> Option<(MutexGuard<'static, ()>, Counters<Platform>)> {
     // A test that failed holding the lock leaves nothing to protect.
     let one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
     let mut c = Counters::new(platform());
-    match c.plan(c"/sys").and_then(|_| c.open()) {
+    match c.plan(c"/sys", Set::Basic).and_then(|_| c.open(Set::Basic)) {
         Ok(()) => Some((one, c)),
         Err(e) => {
             assert!(cannot_count(e.status), "{e:?}");
+            // Counting the other sets needs the basic one first.
             assert!(
-                std::env::var_os("PG_PMU_REQUIRE_COUNTERS").is_none(),
+                std::env::var_os("PG_PMU_REQUIRE_COUNTERS").is_none()
+                    && std::env::var_os("PG_PMU_REQUIRE_EVENTS").is_none(),
                 "this machine must count, but: {e:?}"
             );
             eprintln!("this machine cannot count: {e:?}");
             None
+        }
+    }
+}
+
+/// Plan and open a set other than the basic one, or return false where
+/// the machine cannot count it, unless PG_PMU_REQUIRE_EVENTS says it
+/// must. macOS never counts them.
+#[allow(dead_code)] // Not every binary of tests opens them.
+pub fn open_set(c: &mut Counters<Platform>, set: Set) -> bool {
+    match c.plan(c"/sys", set).and_then(|_| c.open(set)) {
+        Ok(()) => true,
+        Err(e) => {
+            assert!(
+                matches!(
+                    e.status,
+                    Status::EventsNotCounted | Status::NoFreeCounter | Status::NotPermitted
+                ),
+                "{e:?}"
+            );
+            if cfg!(target_os = "macos") {
+                assert_eq!(e.status, Status::EventsNotCounted);
+            }
+            assert!(
+                std::env::var_os("PG_PMU_REQUIRE_EVENTS").is_none(),
+                "this machine must count {set:?}, but: {e:?}"
+            );
+            eprintln!("this machine cannot count {set:?}: {e:?}");
+            false
         }
     }
 }

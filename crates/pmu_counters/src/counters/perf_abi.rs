@@ -26,6 +26,10 @@ pub const PERF_ATTR_SIZE_VER0: u32 = 64;
 pub const PERF_TYPE_HARDWARE: u32 = 0;
 pub const PERF_COUNT_HW_CPU_CYCLES: u64 = 0;
 pub const PERF_COUNT_HW_INSTRUCTIONS: u64 = 1;
+pub const PERF_COUNT_HW_CACHE_REFERENCES: u64 = 2;
+pub const PERF_COUNT_HW_CACHE_MISSES: u64 = 3;
+pub const PERF_COUNT_HW_BRANCH_INSTRUCTIONS: u64 = 4;
+pub const PERF_COUNT_HW_BRANCH_MISSES: u64 = 5;
 /// The type of the unit of a kind of cores goes in the high half of
 /// `config` of a hardware event, since Linux 5.13 on Intel.
 pub const PERF_PMU_TYPE_SHIFT: u32 = 32;

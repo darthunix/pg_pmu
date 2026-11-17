@@ -17,18 +17,24 @@ use loom::thread;
 
 use pmu_counters::Status;
 use pmu_counters::cells::{self, Cell, Contents};
+use pmu_counters::counters::Counts;
 
 /// A worker's report: enter, add, leave. Whether it was taken.
 fn report(cell: &Cell, g: u64, instructions: u64) -> bool {
     match cell.enter(g) {
         Ok(()) => {
-            cell.add(instructions, 2 * instructions);
+            cell.add(&counts_of(instructions));
             cell.leave().unwrap();
             true
         }
         Err(Status::StaleToken) => false,
         Err(e) => panic!("a report failed with {e:?}"),
     }
+}
+
+/// What a worker counted, from its instructions: every value differs.
+fn counts_of(instructions: u64) -> Counts {
+    Counts::from_array([1, 2, 3, 4, 5, 6].map(|k| k * instructions))
 }
 
 /// A worker that could not count reports its failure.
@@ -87,7 +93,7 @@ fn reports_against_a_close() {
         let sum = counting.join().unwrap();
         let failed = failing.join().unwrap();
         let got = give_back_after(first, &cell, g);
-        assert_eq!((got.instructions, got.cycles), (sum, 2 * sum));
+        assert_eq!(got.counts, counts_of(sum));
         assert_eq!(
             (got.failures, got.sqlstate),
             if failed { (1, 53) } else { (0, 0) }
@@ -124,7 +130,7 @@ fn a_late_report_against_a_new_taking() {
         let (first, second) = backend.join().unwrap();
         let accepted = worker.join().unwrap();
         let first = give_back_after(first, &cell, old);
-        assert_eq!(first.instructions, taken(accepted, 7));
+        assert_eq!(first.counts.instructions, taken(accepted, 7));
         assert_eq!(second.unwrap_or_default(), Contents::default());
     });
 }
@@ -160,11 +166,11 @@ fn a_taking_against_an_emptying() {
             thread::spawn(move || {
                 cells::take_from_pool(&pool[..]).map(|(i, g)| {
                     assert!(report(&pool[i], g, 10));
-                    pool[i].give_back(g).unwrap().instructions
+                    pool[i].give_back(g).unwrap().counts.instructions
                 })
             })
         };
-        let mine = pool[0].give_back(g).unwrap().instructions;
+        let mine = pool[0].give_back(g).unwrap().counts.instructions;
         assert_eq!(mine, 5);
         assert!(matches!(other.join().unwrap(), None | Some(10)));
         assert_eq!(pool[0].state().1, 0);
@@ -194,8 +200,8 @@ fn a_nested_cell_handed_down_while_a_report_comes() {
         let handed = try_give_back(&nested, gn);
         let own = try_give_back(&outer, go);
         let want = outer_worker.join().unwrap() + nested_worker.join().unwrap();
-        let handed = give_back_after(handed, &nested, gn).instructions;
-        let own = give_back_after(own, &outer, go).instructions;
+        let handed = give_back_after(handed, &nested, gn).counts.instructions;
+        let own = give_back_after(own, &outer, go).counts.instructions;
         assert_eq!(own + handed, want);
         assert_eq!(nested.read(gn), Err(Status::StaleToken));
     });

@@ -71,9 +71,13 @@ static void *pmu_cells = NULL;
 /* The holds of this backend, the innermost first. */
 static PmuHold *pmu_holds = NULL;
 
-/* A worker that counts: its token, its plan and its counts at the start. */
+/*
+ * A worker that counts: its token, the sets it counts, its plan and its
+ * counts at the start.
+ */
 static bool pmu_worker_counting = false;
 static uint64 pmu_worker_token = 0;
+static uint32 pmu_worker_sets = 0;
 static QueryDesc *pmu_worker_query = NULL;
 static PmuCounts pmu_worker_counts;
 static bool pmu_worker_exit_set = false;
@@ -81,6 +85,7 @@ static bool pmu_worker_exit_set = false;
 static void pmu_shmem_request(void *arg);
 static void pmu_shmem_init(void *arg);
 static bool pmu_cell_check(char **newval, void **extra, GucSource source);
+static int32 pmu_worker_report_counts(const PmuCounts *now);
 static void pmu_hand_down(const PmuCellContents *contents);
 static void pmu_give_back_on_abort(void);
 static void pmu_worker_exit(int code, Datum arg);
@@ -295,9 +300,8 @@ pmu_hand_down(const PmuCellContents *contents)
 
 	if (below != NULL)
 	{
-		below->nested.instructions += contents->instructions +
-			hold->nested.instructions;
-		below->nested.cycles += contents->cycles + hold->nested.cycles;
+		pmu_counts_add(&below->nested.counts, &contents->counts);
+		pmu_counts_add(&below->nested.counts, &hold->nested.counts);
 		below->nested.failures += contents->failures + hold->nested.failures;
 		if (hold->nested.sqlstate != 0)
 			below->nested.sqlstate = hold->nested.sqlstate;
@@ -349,8 +353,7 @@ pmu_hold_read(PmuHold *hold, PmuCellContents *out)
 	status = pmu_cell_read(pmu_cells, hold->token, out);
 	if (status != PMU_OK)
 		pmu_report(status, 0);
-	out->instructions += hold->nested.instructions;
-	out->cycles += hold->nested.cycles;
+	pmu_counts_add(&out->counts, &hold->nested.counts);
 	out->failures += hold->nested.failures;
 	if (out->sqlstate == 0)
 		out->sqlstate = hold->nested.sqlstate;
@@ -368,6 +371,7 @@ void
 pmu_worker_start(QueryDesc *queryDesc)
 {
 	uint64		token;
+	uint32		sets = PMU_EVENTS_BASIC;
 	int32		status;
 
 	if (!IsParallelWorker() || pmu_worker_counting ||
@@ -384,12 +388,12 @@ pmu_worker_start(QueryDesc *queryDesc)
 	{
 		int32		os_error = 0;
 
-		pmu_open_counters();
+		pmu_open_counters(sets);
 #ifdef PMU_TEST_WORKERS_CANNOT_COUNT
 		/* The build of the suite workers_cannot_count. */
 		pmu_report(PMU_NO_COUNTERS, 0);
 #endif
-		status = pmu_counters_acquire(&pmu_worker_counts, &os_error);
+		status = pmu_counters_acquire(sets, &pmu_worker_counts, &os_error);
 		if (status != PMU_OK)
 			pmu_report(status, os_error);
 	}
@@ -407,8 +411,18 @@ pmu_worker_start(QueryDesc *queryDesc)
 		pmu_worker_exit_set = true;
 	}
 	pmu_worker_token = token;
+	pmu_worker_sets = sets;
 	pmu_worker_query = queryDesc;
 	pmu_worker_counting = true;
+}
+
+/* Report what the worker counted since its start, until now. */
+static int32
+pmu_worker_report_counts(const PmuCounts *now)
+{
+	PmuCounts	counted = pmu_counts_minus(now, &pmu_worker_counts);
+
+	return pmu_cell_report(pmu_cells, pmu_worker_token, &counted);
 }
 
 /*
@@ -427,19 +441,17 @@ pmu_worker_finish(QueryDesc *queryDesc)
 		return;
 	pmu_worker_counting = false;
 
-	status = pmu_counters_read(&now, &os_error);
+	status = pmu_counters_read(pmu_worker_sets, &now, &os_error);
 	if (status != PMU_OK)
 	{
 		(void) pmu_cell_report_failure(pmu_cells, pmu_worker_token,
 									   (uint32) pmu_status_sqlstate(status));
 		pmu_report(status, os_error);
 	}
-	status = pmu_cell_report(pmu_cells, pmu_worker_token,
-							 now.instructions - pmu_worker_counts.instructions,
-							 now.cycles - pmu_worker_counts.cycles);
+	status = pmu_worker_report_counts(&now);
 	if (status != PMU_OK)
 		pmu_report(status, 0);
-	status = pmu_counters_release(&os_error);
+	status = pmu_counters_release(pmu_worker_sets, &os_error);
 	if (status != PMU_OK)
 		pmu_report(status, os_error);
 }
@@ -460,11 +472,9 @@ pmu_worker_exit(int code, Datum arg)
 		return;
 	pmu_worker_counting = false;
 
-	status = pmu_counters_read(&now, &os_error);
+	status = pmu_counters_read(pmu_worker_sets, &now, &os_error);
 	if (status == PMU_OK)
-		status = pmu_cell_report(pmu_cells, pmu_worker_token,
-								 now.instructions - pmu_worker_counts.instructions,
-								 now.cycles - pmu_worker_counts.cycles);
+		status = pmu_worker_report_counts(&now);
 	else
 		status = pmu_cell_report_failure(pmu_cells, pmu_worker_token,
 										 (uint32) pmu_status_sqlstate(status));

@@ -9,8 +9,9 @@
 )]
 
 use pmu_counters::Status;
+use pmu_counters::counters::Set;
 
-const ALL: [Status; 17] = [
+const ALL: [Status; 18] = [
     Status::Ok,
     Status::NotPermitted,
     Status::NoSystem,
@@ -28,6 +29,7 @@ const ALL: [Status; 17] = [
     Status::NoCell,
     Status::BadToken,
     Status::TooManyThreads,
+    Status::EventsNotCounted,
 ];
 
 /// The C name of each code, as the header spells it.
@@ -50,8 +52,16 @@ fn c_name(status: Status) -> &'static str {
         Status::NoCell => "PMU_NO_CELL",
         Status::BadToken => "PMU_BAD_TOKEN",
         Status::TooManyThreads => "PMU_TOO_MANY_THREADS",
+        Status::EventsNotCounted => "PMU_EVENTS_NOT_COUNTED",
     }
 }
+
+/// The bits of the sets, as the header names them.
+const SETS: [(&str, Set); 3] = [
+    ("PMU_EVENTS_BASIC", Set::Basic),
+    ("PMU_EVENTS_BRANCHES", Set::Branches),
+    ("PMU_EVENTS_CACHE", Set::Cache),
+];
 
 #[test]
 fn header_codes_match_the_crate() {
@@ -69,14 +79,23 @@ fn header_codes_match_the_crate() {
             Some((name.to_string(), value))
         })
         .collect();
-    assert_eq!(defines.len(), ALL.len(), "codes in the header: {defines:?}");
-    for status in ALL {
-        let name = c_name(status);
-        let value = defines
+    assert_eq!(
+        defines.len(),
+        ALL.len() + SETS.len(),
+        "numbers in the header: {defines:?}"
+    );
+    let value = |name: &str| {
+        defines
             .iter()
             .find(|(n, _)| n == name)
             .unwrap_or_else(|| panic!("{name} is not in the header"))
-            .1;
-        assert_eq!(value, status as i32, "{name}");
+            .1
+    };
+    for status in ALL {
+        let name = c_name(status);
+        assert_eq!(value(name), status as i32, "{name}");
+    }
+    for (name, set) in SETS {
+        assert_eq!(value(name), set.bit() as i32, "{name}");
     }
 }
